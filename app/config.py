@@ -1,0 +1,84 @@
+"""Committed defaults for White List Checker (safe for public clone).
+
+Upload auth is a one-time token prompted at run time (see upload_token.py).
+No live API keys, zip passwords, or auth tokens belong in this file.
+
+Operator/dev overrides: optional config.local.py (gitignored) or environment.
+Volunteers never edit config or create local secret files.
+"""
+
+from __future__ import annotations
+
+import os
+import runpy
+from datetime import datetime
+from pathlib import Path
+
+# Uses system DNS servers by default, set to custom DNS server if needed
+DNS_SERVER = ""
+
+URL_CHECK_LISTS_DIR = "app/url_check_lists"
+RESULTS_DIR = "results"
+
+CHECK_LIMIT_N = 0
+DNS_TIMEOUT = 5
+HTTP_TIMEOUT = 10
+MAX_WORKERS = 20
+
+OUTPUT_CSV = "check_results_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+# Legacy operator flag. Volunteers do not flip this; upload is driven by the
+# interactive one-time token prompt (empty token = local CSV only).
+SEND_RESULT = False
+
+SKIP_CHECK = False
+
+# Hop-first, then direct monitor fallback. Assume the main monitor host is often
+# unreachable; hops are the primary path. Hop hosts are expected to rotate.
+SEND_METHODS_ORDER = ["receiver", "direct"]
+
+# Non-secret direct HTTPS endpoint (auth = prompted one-time token as X-Web-Token).
+SEND_RESULT_DOMAIN = "https://monitor-ru.net"
+SEND_RESULT_PATH = "/api/submit_dns_check_result_zip"
+SEND_RESULT_ENDPOINT = SEND_RESULT_DOMAIN + SEND_RESULT_PATH
+SEND_RESULT_DIRECT_TIMEOUT_SEC = 10.0
+
+# Non-secret hop list (tried in order). Hosts/IPs may change over time so traffic
+# does not permanently fingerprint a single upload address. Volunteers never
+# configure this list; auth is only the prompted one-time token (X-Web-Token).
+RECEIVER_HOPS = [
+    {
+        "host": "45.143.203.252",
+        "port": 5000,
+        "scheme": "http",
+        "path": "/upload",
+        "timeout_sec": 300.0,
+        "insecure_tls": False,
+    },
+]
+
+# Same wording as README.txt - where volunteers get the one-time token.
+TOKEN_SOURCE_TEXT = (
+    "Get a one-time upload token from Na Svyazi Helpdesk "
+    "(nasvyazi.org / your usual support channel)."
+)
+
+# Optional operator/dev overrides from environment (not used by volunteers).
+_ENV_ENDPOINT = (os.environ.get("SEND_RESULT_ENDPOINT") or "").strip()
+if _ENV_ENDPOINT:
+    SEND_RESULT_ENDPOINT = _ENV_ENDPOINT
+
+
+def _apply_local_overrides() -> None:
+    """Load UPPER_CASE assignments from optional config.local.py if present."""
+    local_path = Path(__file__).resolve().parent / "config.local.py"
+    if not local_path.is_file():
+        return
+    ns = runpy.run_path(str(local_path))
+    g = globals()
+    for key, value in ns.items():
+        if key.isupper() and not key.startswith("_"):
+            g[key] = value
+
+
+_apply_local_overrides()

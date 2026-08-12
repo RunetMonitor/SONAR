@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__
+.pytest_cache
+.venv
+# Local scan output (may contain volunteer IP / region) — never commit
+results/
+results/**
+*.csv
+.env
+*.local.py
+config.local.py
+app/config.local.py
+app/.env
+app/.coverage
+.coverage
