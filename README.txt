@@ -1,3 +1,7 @@
+White List Checker - alpha 1.2.0
+Na Svyazi / Runet Monitor
+License: MIT (see LICENSE)
+
 Required:
 Python 3.6 or newer
 (optional for upload: the requests package - pip install requests)
@@ -66,3 +70,10 @@ Operators / developers only
 
 Optional local overrides: app/config.local.py or environment (gitignored).
 Volunteers never need this. See app/config.example.py.
+
+========
+
+License
+
+Released under the MIT License. Copyright (c) 2026 Na Svyazi.
+See LICENSE.
