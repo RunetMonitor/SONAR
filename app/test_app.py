@@ -1114,7 +1114,7 @@ class TestCsvNoIpPersistence:
 
 class TestReadmeVolunteerWording:
     def test_readme_matches_token_source(self):
-        readme = (ROOT / "README.txt").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
         assert "without VPN" in readme
         assert "Helpdesk" in readme
         assert "nasvyazi.org" in readme
