@@ -21,3 +21,13 @@ Volunteers use the interactive one-time token prompt; they never edit config.
 
 # SEND_METHODS_ORDER = ["receiver", "direct"]
 # SKIP_CHECK = False
+
+# DNS_PROBE_ENABLED = False
+# DNS_PROBE_QPS_GLOBAL = 40.0
+# DNS_PROBE_QPS_RUSSIAN = 15.0
+# DNS_PROBE_MAX_SECONDS = 300.0
+
+# Version notice: a Russia-reachable copy of app/version.txt, tried first.
+# VERSION_CHECK_URLS = [
+#     "https://nasvyazi.org/whitelist-checker-version.txt",
+# ] + list(VERSION_CHECK_URLS)

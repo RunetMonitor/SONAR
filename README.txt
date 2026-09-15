@@ -1,4 +1,4 @@
-White List Checker - alpha 1.2.0
+White List Checker - alpha 1.3.0
 Na Svyazi / Runet Monitor
 License: MIT (see LICENSE)
 
@@ -34,6 +34,8 @@ python3 run.py
 What happens when you run
 
 1. The script reminds you to run without VPN.
+   If a newer version exists, it says so in uppercase at the start
+   and again at the end (GitHub/CDNs; if those are blocked, it stays quiet).
 2. It asks for your one-time upload token before the scan.
    - Paste the token from Helpdesk / support to scan and upload.
    - Leave empty for a local-only scan (CSV saved, no upload).
@@ -44,6 +46,12 @@ What happens when you run
    Hop hosts may change over time; you do not configure them.
 5. Auth is only that one-time token (used as the zip password and as
    X-Web-Token). No zip password in the package. Do not edit config.py.
+
+========
+
+The scan also queries extra DNS servers listed in app/dns_servers.txt.
+That runs in the background during the usual check. Results go into the
+same CSV (dns_probe_* columns).
 
 ========
 

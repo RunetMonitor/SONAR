@@ -58,6 +58,11 @@ from upload_token import (
     verify_upload_token,
 )
 
+try:
+    import dns_probe
+except ImportError:
+    dns_probe = None
+
 STRIP_EMPTY_DOMAIN_FIELDS = True
 
 _SCRIPT_DIR = _ROOT_DIR
@@ -71,6 +76,8 @@ STATUS_MAP = {
     "ERROR": "error",
 }
 
+PROBE_META_COLUMNS = ("dns_probe_resolvers", "dns_probe_meta")
+
 _EXCLUDED = {
     "domain",
     "accessible",
@@ -78,7 +85,9 @@ _EXCLUDED = {
     "check_provider",
     "check_ip_address",
     "check_version",
+    "probe_key",
 }
+_EXCLUDED.update(PROBE_META_COLUMNS)
 
 # Trailing " (public IP)" on region strings from older clients.
 _REGION_IP_SUFFIX_RE = re.compile(
@@ -336,6 +345,30 @@ def _resolve_csv_path() -> Path:
     return Path(paths[0])
 
 
+def _probe_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    roster = ""
+    meta = ""
+    for row in rows:
+        roster = roster or (row.get("dns_probe_resolvers") or "").strip()
+        meta = meta or (row.get("dns_probe_meta") or "").strip()
+        if roster and meta:
+            break
+    if not roster and not meta:
+        return {}
+
+    summary: Dict[str, Any] = {}
+    if roster:
+        summary["resolvers_raw"] = roster
+    if meta:
+        summary["meta_raw"] = meta
+    if dns_probe is not None:
+        if roster:
+            summary["resolvers"] = dns_probe.parse_roster(roster)
+        if meta:
+            summary["meta"] = dns_probe.parse_meta(meta)
+    return summary
+
+
 def _build_payload(rows: List[Dict[str, Any]], csv_path: Path) -> Dict[str, Any]:
     counts = {"YES": 0, "PARTIAL": 0, "NO": 0, "ERROR": 0}
     for r in rows:
@@ -358,9 +391,14 @@ def _build_payload(rows: List[Dict[str, Any]], csv_path: Path) -> Dict[str, Any]
         entry["status"] = STATUS_MAP.get(r.get("accessible", ""), "error")
         domains.append(entry)
 
+    result_data: Dict[str, Any] = {"domains": domains}
+    probe_summary = _probe_summary(rows)
+    if probe_summary:
+        result_data["dns_probe"] = probe_summary
+
     # Omit end-user ip_address from upload. Region is sanitized (no public IP suffix).
     return {
-        "result_data": {"domains": domains},
+        "result_data": result_data,
         "dns_servers": get_dns_servers(),
         "region": sanitize_region(first.get("check_location", "")),
         "provider": first.get("check_provider", ""),
