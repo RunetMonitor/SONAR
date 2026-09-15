@@ -350,39 +350,62 @@ def _is_remote_newer(local, remote):
     return remote_key > local_key
 
 
+def _fetch_one_version(url, timeout):
+    url = (url or "").strip()
+    if not url:
+        return ""
+    resp = None
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "WhiteListChecker"}
+        )
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        body = resp.read(65)
+    except Exception:
+        return ""
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    if not body or len(body) > 64:
+        return ""
+    return _parse_version_text(body.decode("utf-8", errors="replace"))
+
+
+def _newest_version(versions):
+    best = ""
+    for ver in versions:
+        if not _version_key(ver):
+            continue
+        if not best or _is_remote_newer(best, ver):
+            best = ver
+    return best
+
+
 def _fetch_latest_version(urls=None, timeout=None):
-    """Return remote version string, or empty if every URL fails / looks wrong."""
+    """Return the newest remote version, or empty if every URL fails."""
     if urls is None:
         urls = VERSION_CHECK_URLS
     if timeout is None:
         timeout = VERSION_CHECK_TIMEOUT
+    urls = [(u or "").strip() for u in urls]
+    urls = [u for u in urls if u]
     if not urls:
         return ""
-    headers = {"User-Agent": "WhiteListChecker"}
-    for url in urls:
-        url = (url or "").strip()
-        if not url:
-            continue
-        resp = None
-        body = b""
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            resp = urllib.request.urlopen(req, timeout=timeout)
-            body = resp.read(65)
-        except Exception:
-            continue
-        finally:
-            if resp is not None:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-        if not body or len(body) > 64:
-            continue
-        parsed = _parse_version_text(body.decode("utf-8", errors="replace"))
-        if parsed:
-            return parsed
-    return ""
+    found = []
+    workers = min(3, len(urls))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(_fetch_one_version, url, timeout) for url in urls]
+        for fut in as_completed(futs):
+            try:
+                ver = fut.result()
+            except Exception:
+                continue
+            if ver:
+                found.append(ver)
+    return _newest_version(found)
 
 
 def _print_update_notice(local, remote):
