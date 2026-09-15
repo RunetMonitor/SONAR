@@ -71,7 +71,7 @@ RECEIVER_HOPS = [
     },
 ]
 
-# Same wording as README.txt - where volunteers get the one-time token.
+# Same wording as README.md - where volunteers get the one-time token.
 TOKEN_SOURCE_TEXT = (
     "Get a one-time upload token from Na Svyazi Helpdesk "
     "(nasvyazi.org / your usual support channel)."
