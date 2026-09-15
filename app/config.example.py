@@ -29,5 +29,7 @@ Volunteers use the interactive one-time token prompt; they never edit config.
 
 # Version notice: a Russia-reachable copy of app/version.txt, tried first.
 # VERSION_CHECK_URLS = [
-#     "https://nasvyazi.org/whitelist-checker-version.txt",
-# ] + list(VERSION_CHECK_URLS)
+#     "https://cdn.jsdelivr.net/gh/RunetMonitor/SONAR@main/app/version.txt",
+#     "https://cdn.statically.io/gh/RunetMonitor/SONAR/main/app/version.txt",
+#     "https://raw.githubusercontent.com/RunetMonitor/SONAR/main/app/version.txt",
+# ]

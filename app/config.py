@@ -1,4 +1,4 @@
-"""Committed defaults for White List Checker (safe for public clone).
+"""Committed defaults for SONAR (safe for public clone).
 
 Upload auth is a one-time token prompted at run time (see upload_token.py).
 No live API keys, zip passwords, or auth tokens belong in this file.
@@ -81,9 +81,9 @@ TOKEN_SOURCE_TEXT = (
 # CDNs of the same file first. Failures are silent; the scan still runs.
 VERSION_CHECK_TIMEOUT = 2.0
 VERSION_CHECK_URLS = [
-    "https://cdn.jsdelivr.net/gh/RunetMonitor/WhiteListCheckerScript@main/app/version.txt",
-    "https://cdn.statically.io/gh/RunetMonitor/WhiteListCheckerScript/main/app/version.txt",
-    "https://raw.githubusercontent.com/RunetMonitor/WhiteListCheckerScript/main/app/version.txt",
+    "https://cdn.jsdelivr.net/gh/RunetMonitor/SONAR@main/app/version.txt",
+    "https://cdn.statically.io/gh/RunetMonitor/SONAR/main/app/version.txt",
+    "https://raw.githubusercontent.com/RunetMonitor/SONAR/main/app/version.txt",
 ]
 
 # Optional operator/dev overrides from environment (not used by volunteers).

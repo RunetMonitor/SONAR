@@ -2,9 +2,11 @@
   <img src="app/logo.jpg" alt="SONAR" width="180">
 </p>
 
-White List Checker - alpha  
+SONAR - alpha  
 Na Svyazi / Runet Monitor  
 License: MIT (see LICENSE)
+
+https://github.com/RunetMonitor/SONAR
 
 Required:  
 Python 3.6 or newer  
