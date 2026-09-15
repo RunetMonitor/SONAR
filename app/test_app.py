@@ -263,7 +263,7 @@ class TestVersionCheck:
         run._print_update_notice("", "1.9.0")
         assert capsys.readouterr().out == ""
 
-    def test_fetch_uses_first_url_that_returns_a_version(self, monkeypatch):
+    def test_fetch_uses_another_url_when_the_first_fails(self, monkeypatch):
         calls = []
 
         class _Resp(object):
@@ -290,6 +290,29 @@ class TestVersionCheck:
         )
         assert got == "1.4.0"
         assert len(calls) == 2
+
+    def test_fetch_picks_newest_when_mirrors_disagree(self, monkeypatch):
+        class _Resp(object):
+            def __init__(self, body):
+                self._body = body
+
+            def read(self, n=-1):
+                return self._body[:n] if n >= 0 else self._body
+
+            def close(self):
+                pass
+
+        def fake_urlopen(req, timeout=None):
+            if "stale.example" in req.full_url:
+                return _Resp(b"1.2.0\n")
+            return _Resp(b"1.3.0\n")
+
+        monkeypatch.setattr(run.urllib.request, "urlopen", fake_urlopen)
+        got = run._fetch_latest_version(
+            urls=["https://stale.example/v", "https://fresh.example/v"],
+            timeout=1,
+        )
+        assert got == "1.3.0"
 
     def test_fetch_stays_quiet_on_total_failure(self, monkeypatch):
         def boom(*_a, **_k):
