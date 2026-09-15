@@ -24,6 +24,7 @@ _APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app")
 if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
 
+from banner import print_banner
 from config import (
     CHECK_LIMIT_N,
     DNS_PROBE_ATTEMPTS,
@@ -922,6 +923,8 @@ def _resolve_skip_check_csv_path(results_dir):
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__)) or "."
     results_dir = os.path.join(script_dir, RESULTS_DIR)
+
+    print_banner()
 
     ver = _read_version_text(script_dir)
     remote = _fetch_latest_version()
