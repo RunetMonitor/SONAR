@@ -27,6 +27,20 @@ MAX_WORKERS = 20
 
 OUTPUT_CSV = "check_results_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M%S"))
 
+# extra DNS lookups against the list in DNS_PROBE_SERVERS_FILE
+DNS_PROBE_ENABLED = True
+DNS_PROBE_SERVERS_FILE = "app/dns_servers.txt"
+DNS_PROBE_TIMEOUT = 1.5
+DNS_PROBE_ATTEMPTS = 3
+# q/s per resolver. keep russian/isp ones slower so we don't get blocked
+DNS_PROBE_QPS_GLOBAL = 40.0
+DNS_PROBE_QPS_RUSSIAN = 15.0
+DNS_PROBE_MAX_INFLIGHT = 600
+DNS_PROBE_MAX_INFLIGHT_PER_SERVER = 100
+# drop a resolver if it stays silent this many times in a row
+DNS_PROBE_BREAKER_FAILURES = 15
+DNS_PROBE_MAX_SECONDS = 300.0
+
 # Legacy operator flag. Volunteers do not flip this; upload is driven by the
 # interactive one-time token prompt (empty token = local CSV only).
 SEND_RESULT = False
@@ -62,6 +76,15 @@ TOKEN_SOURCE_TEXT = (
     "Get a one-time upload token from Na Svyazi Helpdesk "
     "(nasvyazi.org / your usual support channel)."
 )
+
+# Latest app/version.txt. GitHub is often blocked in Russia, so try public
+# CDNs of the same file first. Failures are silent; the scan still runs.
+VERSION_CHECK_TIMEOUT = 2.0
+VERSION_CHECK_URLS = [
+    "https://cdn.jsdelivr.net/gh/RunetMonitor/WhiteListCheckerScript@main/app/version.txt",
+    "https://cdn.statically.io/gh/RunetMonitor/WhiteListCheckerScript/main/app/version.txt",
+    "https://raw.githubusercontent.com/RunetMonitor/WhiteListCheckerScript/main/app/version.txt",
+]
 
 # Optional operator/dev overrides from environment (not used by volunteers).
 _ENV_ENDPOINT = (os.environ.get("SEND_RESULT_ENDPOINT") or "").strip()

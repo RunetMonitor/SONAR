@@ -12,6 +12,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -25,6 +26,16 @@ if _APP_DIR not in sys.path:
 
 from config import (
     CHECK_LIMIT_N,
+    DNS_PROBE_ATTEMPTS,
+    DNS_PROBE_BREAKER_FAILURES,
+    DNS_PROBE_ENABLED,
+    DNS_PROBE_MAX_INFLIGHT,
+    DNS_PROBE_MAX_INFLIGHT_PER_SERVER,
+    DNS_PROBE_MAX_SECONDS,
+    DNS_PROBE_QPS_GLOBAL,
+    DNS_PROBE_QPS_RUSSIAN,
+    DNS_PROBE_SERVERS_FILE,
+    DNS_PROBE_TIMEOUT,
     DNS_SERVER,
     DNS_TIMEOUT,
     HTTP_TIMEOUT,
@@ -34,8 +45,15 @@ from config import (
     SKIP_CHECK,
     TOKEN_SOURCE_TEXT,
     URL_CHECK_LISTS_DIR,
+    VERSION_CHECK_TIMEOUT,
+    VERSION_CHECK_URLS,
 )
 from upload_token import normalize_pasted_token, verify_upload_token
+
+try:
+    import dns_probe
+except ImportError:
+    dns_probe = None
 
 
 def pause_if_windows():
@@ -295,6 +313,98 @@ def _read_version_text(script_dir):
         if s:
             return s
     return ""
+
+
+_VERSION_RE = re.compile(r"^v?(\d+(?:\.\d+){0,3})$", re.IGNORECASE)
+
+
+def _parse_version_text(text):
+    if not text:
+        return ""
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        match = _VERSION_RE.match(s)
+        if not match:
+            return ""
+        return match.group(1)
+    return ""
+
+
+def _version_key(text):
+    parsed = _parse_version_text(text)
+    if not parsed:
+        return None
+    return tuple(int(part) for part in parsed.split("."))
+
+
+def _is_remote_newer(local, remote):
+    local_key = _version_key(local)
+    remote_key = _version_key(remote)
+    if local_key is None or remote_key is None:
+        return False
+    size = max(len(local_key), len(remote_key))
+    local_key = local_key + (0,) * (size - len(local_key))
+    remote_key = remote_key + (0,) * (size - len(remote_key))
+    return remote_key > local_key
+
+
+def _fetch_latest_version(urls=None, timeout=None):
+    """Return remote version string, or empty if every URL fails / looks wrong."""
+    if urls is None:
+        urls = VERSION_CHECK_URLS
+    if timeout is None:
+        timeout = VERSION_CHECK_TIMEOUT
+    if not urls:
+        return ""
+    headers = {"User-Agent": "WhiteListChecker"}
+    for url in urls:
+        url = (url or "").strip()
+        if not url:
+            continue
+        resp = None
+        body = b""
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            body = resp.read(65)
+        except Exception:
+            continue
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+        if not body or len(body) > 64:
+            continue
+        parsed = _parse_version_text(body.decode("utf-8", errors="replace"))
+        if parsed:
+            return parsed
+    return ""
+
+
+def _print_update_notice(local, remote):
+    if not _is_remote_newer(local, remote):
+        return
+    print()
+    print(
+        "A NEWER VERSION OF THIS SCRIPT IS AVAILABLE ({}). YOU HAVE {}.".format(
+            remote, local
+        )
+    )
+    print(
+        "ASK NASVYAZI HELPDESK (NASVYAZI.ORG) OR SEE "
+        "GITHUB.COM/RUNETMONITOR/WHITELISTCHECKERSCRIPT"
+    )
+    print()
+
+
+def _print_version_block(local, remote):
+    print("Version: {}".format(local if local else "-"))
+    _print_update_notice(local, remote)
+
 
 def check_domain(domain, source_file, server=None, original=None):
     row = {
@@ -618,6 +728,153 @@ def _print_final_verdict(results, script_dir):
     print("  FINAL VERDICT: {} {}".format(line1, line2))
 
 
+class _ProbeHandle(object):
+    __slots__ = ("thread", "box", "stop", "resolvers", "started", "total")
+
+    def __init__(self, thread, box, stop, resolvers, started, total):
+        self.thread = thread
+        self.box = box
+        self.stop = stop
+        self.resolvers = resolvers
+        self.started = started
+        self.total = total
+
+
+def _probe_servers_path(script_dir):
+    return os.path.join(script_dir, *DNS_PROBE_SERVERS_FILE.split("/"))
+
+
+def _probe_domains(tasks):
+    seen = set()
+    domains = []
+    for _original, ascii_domain, _src in tasks:
+        name = (ascii_domain or "").strip().rstrip(".").lower()
+        if name and name not in seen:
+            seen.add(name)
+            domains.append(name)
+    return domains
+
+
+def _start_dns_probe(script_dir, tasks):
+    if dns_probe is None or not DNS_PROBE_ENABLED:
+        return None
+    resolvers = dns_probe.load_resolvers(_probe_servers_path(script_dir))
+    if not resolvers:
+        return None
+    domains = _probe_domains(tasks)
+    if not domains:
+        return None
+
+    box = {}
+    stop = threading.Event()
+    qps = {
+        dns_probe.KIND_GLOBAL: DNS_PROBE_QPS_GLOBAL,
+        dns_probe.KIND_RUSSIAN: DNS_PROBE_QPS_RUSSIAN,
+        dns_probe.KIND_NSDI: DNS_PROBE_QPS_RUSSIAN,
+    }
+
+    def worker():
+        try:
+            box["result"] = dns_probe.probe(
+                domains,
+                resolvers,
+                timeout=DNS_PROBE_TIMEOUT,
+                attempts=DNS_PROBE_ATTEMPTS,
+                qps_by_kind=qps,
+                max_inflight=DNS_PROBE_MAX_INFLIGHT,
+                max_inflight_per_server=DNS_PROBE_MAX_INFLIGHT_PER_SERVER,
+                breaker_failures=DNS_PROBE_BREAKER_FAILURES,
+                max_seconds=DNS_PROBE_MAX_SECONDS,
+                stop_event=stop,
+            )
+        except Exception as exc:
+            box["error"] = str(exc).replace("\n", " ")
+
+    thread = threading.Thread(target=worker, name="dns-probe")
+    thread.daemon = True
+    thread.start()
+    return _ProbeHandle(
+        thread, box, stop, resolvers, time.monotonic(), len(domains)
+    )
+
+
+def _finish_dns_probe(handle):
+    if handle is None:
+        return None
+
+    def _join(timeout):
+        try:
+            handle.thread.join(timeout)
+            return True
+        except KeyboardInterrupt:
+            return False
+
+    interrupted = False
+    if handle.thread.is_alive():
+        remaining = DNS_PROBE_MAX_SECONDS - (time.monotonic() - handle.started)
+        print(
+            "  Finishing DNS probe ({} resolvers, up to {}s left) ...".format(
+                len(handle.resolvers), max(0, int(remaining))
+            )
+        )
+        if not _join(max(5.0, remaining + 15.0)):
+            interrupted = True
+    if handle.thread.is_alive() or interrupted:
+        if interrupted:
+            print("  DNS probe interrupted; keeping whatever finished")
+        handle.stop.set()
+        _join(2.0 if interrupted else 20.0)
+    error = handle.box.get("error")
+    if error:
+        print("  DNS probe failed: {}".format(error))
+    return handle.box.get("result")
+
+
+def _apply_dns_probe(results, probe_result):
+    if dns_probe is None:
+        return
+    blank = dict(dns_probe.EMPTY_COLUMNS)
+    if probe_result is None:
+        for row in results:
+            row.update(blank)
+        return
+    resolvers = probe_result.resolvers
+    for row in results:
+        outcomes = probe_result.by_domain.get(row.get("probe_key", ""))
+        if outcomes:
+            row.update(dns_probe.format_columns(outcomes, resolvers))
+        else:
+            row.update(blank)
+
+
+def _print_dns_probe_summary(probe_result):
+    if probe_result is None:
+        return
+    print()
+    print(
+        "  DNS probe   : {}/{} lookups over {} resolvers in {:.1f}s".format(
+            probe_result.queries_done,
+            probe_result.queries_total,
+            len(probe_result.resolvers),
+            probe_result.elapsed,
+        )
+    )
+    if probe_result.dead:
+        print(
+            "  Stopped     : {} (no replies for a while)".format(
+                ", ".join(probe_result.dead)
+            )
+        )
+    if probe_result.conflicts:
+        print(
+            "  Disagreed   : {} (later packet for the same query)".format(
+                probe_result.conflicts
+            )
+        )
+    if probe_result.stopped_early:
+        print("  Note        : probe hit its time limit")
+
+
 def _resolve_skip_check_csv_path(results_dir):
     """Prefer OUTPUT_CSV if that file exists; otherwise newest results/check_results_*.csv.
 
@@ -644,7 +901,8 @@ def main():
     results_dir = os.path.join(script_dir, RESULTS_DIR)
 
     ver = _read_version_text(script_dir)
-    print("Version: {}".format(ver if ver else "-"))
+    remote = _fetch_latest_version()
+    _print_version_block(ver, remote)
     print()
 
     if SKIP_CHECK:
@@ -678,6 +936,10 @@ def main():
                 sys.exit(code)
         else:
             print("  No token; nothing to upload. CSV kept.")
+        print()
+        if not remote:
+            remote = _fetch_latest_version()
+        _print_version_block(ver, remote)
         return
 
     # Volunteer UX: token before scan. Empty = local CSV only.
@@ -740,6 +1002,14 @@ def main():
         )
     )
 
+    probe_handle = _start_dns_probe(script_dir, tasks)
+    if probe_handle is not None:
+        print(
+            "  DNS probe  : {} resolvers x {} unique domains (in background)\n".format(
+                len(probe_handle.resolvers), probe_handle.total
+            )
+        )
+
     # No check_ip_address column - end-user public IP is not persisted.
     fieldnames = [
         "domain",
@@ -767,6 +1037,9 @@ def main():
         "check_provider",
         "check_version",
     ]
+    if dns_probe is not None:
+        fieldnames.extend(dns_probe.COLUMNS)
+        fieldnames.extend(dns_probe.META_COLUMNS)
 
     results = []
     done = 0
@@ -783,6 +1056,7 @@ def main():
             done += 1
             try:
                 row = f.result()
+                row["probe_key"] = (ascii_domain or "").strip().rstrip(".").lower()
                 results.append(row)
                 flag = {"YES": "+", "PARTIAL": "~", "NO": "-"}.get(
                     row["accessible"], "!"
@@ -805,6 +1079,7 @@ def main():
                     source_file=src,
                     dns_error=str(exc),
                     accessible="ERROR",
+                    probe_key=(ascii_domain or "").strip().rstrip(".").lower(),
                 )
                 print(
                     "  [{:>4}/{}] ! {:<40s}  ERROR: {}  [{}]".format(
@@ -813,6 +1088,9 @@ def main():
                 )
 
     elapsed = time.monotonic() - t_start
+
+    probe_result = _finish_dns_probe(probe_handle)
+    _apply_dns_probe(results, probe_result)
 
     results.sort(key=lambda r: (r["source_file"], r["domain"]))
 
@@ -825,6 +1103,11 @@ def main():
             results[0]["check_location"] = location
             results[0]["check_provider"] = isp
             results[0]["check_version"] = _read_version_text(script_dir)
+            if dns_probe is not None and probe_result is not None:
+                results[0]["dns_probe_resolvers"] = dns_probe.format_roster(
+                    probe_result.resolvers
+                )
+                results[0]["dns_probe_meta"] = dns_probe.format_meta(probe_result)
         w.writerows(results)
 
     yes = sum(1 for r in results if r["accessible"] == "YES")
@@ -840,6 +1123,7 @@ def main():
     print("  Blocked/Down : {}".format(no))
     print("  Errors       : {}".format(errs))
     print("  Total        : {}".format(total))
+    _print_dns_probe_summary(probe_result)
     print()
     print("  CSV saved to: {}".format(out_path))
 
@@ -868,7 +1152,9 @@ def main():
         )
 
     print()
-    print("Version: {}".format(ver if ver else "-"))
+    if not remote:
+        remote = _fetch_latest_version()
+    _print_version_block(ver, remote)
     print()
     _print_final_verdict(results, script_dir)
 

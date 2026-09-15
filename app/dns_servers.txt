@@ -1,0 +1,16 @@
+# slug,ip,kind,name
+# kind: global | russian | nsdi
+
+adguard,94.140.14.14,global,AdGuard
+cloudflare,1.1.1.1,global,Cloudflare_DNS_1
+comodo,8.20.247.20,global,Comodo_Secure_DNS_2
+google,8.8.8.8,global,Google_Public_DNS_Servers_1
+quad9,9.9.9.9,global,Quad9_DNS_1
+
+nsdi,195.208.4.1,nsdi,НСДИ
+
+centraltelegraph,213.85.168.57,russian,Central_Telegraph_Public_Joint_stock_Company_Central_Federal_District
+ertelecom,94.180.111.233,russian,JSC_ER_Telecom_Holding_Novosibirsk_branch_Siberian_Federal_District
+mts,195.210.172.43,russian,MTS_PJSC_Central_Federal_District_1
+teleservice,87.244.16.6,russian,AO_Tele_Service_Tula_Central_Federal_District
+vimpelcom,95.31.233.13,russian,PJSC_Vimpelcom_Central_Federal_District_2
