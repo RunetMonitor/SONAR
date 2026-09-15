@@ -1,4 +1,4 @@
-White List Checker - alpha 1.3.0
+White List Checker - alpha
 Na Svyazi / Runet Monitor
 License: MIT (see LICENSE)
 

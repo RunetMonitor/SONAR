@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
+import banner  # noqa: E402
 import config  # noqa: E402
 import dns_probe  # noqa: E402
 import run  # noqa: E402
@@ -96,6 +97,94 @@ class TestConfig:
         text = example.read_text(encoding="utf-8")
         assert "Volunteers" in text or "volunteers" in text
         assert "config.local.py" in text
+
+
+class TestBanner:
+    def test_bitmap_is_even_grid(self):
+        assert banner.WIDTH == 56
+        assert banner.HEIGHT == 44
+        assert banner.HEIGHT % 2 == 0
+        assert all(len(row) == banner.WIDTH for row in banner._ROWS)
+        assert set("".join(banner._ROWS)) <= set(".#+")
+        for row in banner._ROWS:
+            for i in range(banner.WIDTH // 2):
+                left, right = row[i], row[banner.WIDTH - 1 - i]
+                if left == "+" or right == "+":
+                    assert left == right == "+"
+
+    def test_s_o_n_a_have_natural_symmetry(self):
+        rows = banner._ROWS
+
+        def ink(y, x):
+            return rows[y][x] == "#"
+
+        def rot180(x0, x1, y0, y1):
+            w, h = x1 - x0 + 1, y1 - y0 + 1
+            for ly in range(h):
+                for lx in range(w):
+                    assert ink(y0 + ly, x0 + lx) == ink(
+                        y0 + h - 1 - ly, x0 + w - 1 - lx
+                    )
+
+        def lr(x0, x1, y0, y1):
+            w, h = x1 - x0 + 1, y1 - y0 + 1
+            for ly in range(h):
+                for lx in range(w // 2):
+                    assert ink(y0 + ly, x0 + lx) == ink(y0 + ly, x0 + w - 1 - lx)
+
+        rot180(1, 7, 1, 9)  # S
+        lr(11, 19, 1, 9)  # O
+        rot180(24, 31, 1, 9)  # N
+        lr(36, 43, 1, 9)  # A
+
+    def test_truecolor_render_uses_gray_letters_without_navy_fill(self):
+        lines = banner.render_banner(bits=24, half=True, min_width=banner.WIDTH)
+        assert len(lines) == banner.HEIGHT // 2
+        blob = "".join(lines)
+        assert "\033[48;2;9;11;26m" not in blob
+        assert "\033[38;2;107;114;128m" in blob
+        assert "\033[38;2;88;144;112m" in blob or "\033[48;2;88;144;112m" in blob
+        assert "\033[0m" in blob
+
+    def test_print_banner_silent_when_not_a_tty(self, monkeypatch, capsys):
+        monkeypatch.setattr(banner, "_isatty", lambda: False)
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
+        banner.print_banner()
+        assert capsys.readouterr().out == ""
+
+    def test_print_banner_force_color(self, monkeypatch, capsys):
+        monkeypatch.setenv("FORCE_COLOR", "3")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(banner, "_isatty", lambda: False)
+        monkeypatch.setattr(banner, "_term_cols", lambda: 120)
+        monkeypatch.setattr(banner, "_vt_windows", lambda: True)
+        banner.print_banner()
+        out = capsys.readouterr().out
+        assert "\033[38;2;107;114;128m" in out
+        assert "\033[48;2;9;11;26m" not in out
+
+    def test_print_banner_force_256_color(self, monkeypatch, capsys):
+        monkeypatch.setenv("FORCE_COLOR", "2")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(banner, "_isatty", lambda: False)
+        monkeypatch.setattr(banner, "_term_cols", lambda: 120)
+        monkeypatch.setattr(banner, "_vt_windows", lambda: True)
+        banner.print_banner()
+        out = capsys.readouterr().out
+        assert "\033[38;5;243m" in out
+        assert "\033[38;2;" not in out
+
+    def test_print_banner_force_16_color(self, monkeypatch, capsys):
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(banner, "_isatty", lambda: False)
+        monkeypatch.setattr(banner, "_term_cols", lambda: 120)
+        monkeypatch.setattr(banner, "_vt_windows", lambda: True)
+        banner.print_banner()
+        out = capsys.readouterr().out
+        assert "\033[90m" in out
+        assert "\033[38;2;" not in out
+        assert "\033[38;5;" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -3257,3 +3346,770 @@ class TestProbeUploadCompatibility:
                 restored = json.loads(zf.read("payload.json").decode("utf-8"))
             assert restored["total"] == 2
             assert ("dns_probe" in restored["result_data"]) is (label == "new")
+
+
+# ---------------------------------------------------------------------------
+# Remaining branches: banner palettes, version fetch edges, ImportError
+# fallbacks, and dns_probe error / retry internals.
+# ---------------------------------------------------------------------------
+
+
+class _FakeCtypesKernel32(object):
+    def __init__(self, handle=1, get_mode_ok=True, set_mode_ok=True, cp_error=False):
+        self.handle = handle
+        self.get_mode_ok = get_mode_ok
+        self.set_mode_ok = set_mode_ok
+        self.cp_error = cp_error
+        self.set_cp_called = False
+
+    def GetStdHandle(self, _n):
+        return self.handle
+
+    def GetConsoleMode(self, _handle, mode):
+        if not self.get_mode_ok:
+            return 0
+        mode.value = 0
+        return 1
+
+    def SetConsoleMode(self, _handle, _mode):
+        return 1 if self.set_mode_ok else 0
+
+    def SetConsoleOutputCP(self, _cp):
+        self.set_cp_called = True
+        if self.cp_error:
+            raise OSError("SetConsoleOutputCP failed")
+
+
+def _install_fake_ctypes(monkeypatch, kernel32):
+    import types
+
+    ctypes_mod = types.ModuleType("ctypes")
+
+    class _CUInt32(object):
+        def __init__(self, value=0):
+            self.value = value
+
+    ctypes_mod.c_uint32 = _CUInt32
+    ctypes_mod.byref = lambda obj: obj
+    ctypes_mod.windll = types.SimpleNamespace(kernel32=kernel32)
+    monkeypatch.setitem(sys.modules, "ctypes", ctypes_mod)
+    return ctypes_mod
+
+
+class _RecordingStdout(object):
+    def __init__(self, encoding="utf-8", fail=None, fail_after=0):
+        self.encoding = encoding
+        self.fail = fail
+        self.fail_after = fail_after
+        self.writes = []
+        self.flushed = 0
+
+    def write(self, data):
+        if self.fail is not None and len(self.writes) >= self.fail_after:
+            raise self.fail
+        self.writes.append(data)
+        return len(data)
+
+    def flush(self):
+        self.flushed += 1
+
+    def isatty(self):
+        return True
+
+
+class TestBannerFullCoverage:
+    def test_vt_windows_is_a_noop_on_posix(self, monkeypatch):
+        monkeypatch.setattr(banner.sys, "platform", "darwin")
+        assert banner._vt_windows() is True
+
+    def test_vt_windows_rejects_a_missing_console_handle(self, monkeypatch):
+        monkeypatch.setattr(banner.sys, "platform", "win32")
+        _install_fake_ctypes(monkeypatch, _FakeCtypesKernel32(handle=0))
+        assert banner._vt_windows() is False
+        _install_fake_ctypes(monkeypatch, _FakeCtypesKernel32(handle=-1))
+        assert banner._vt_windows() is False
+
+    def test_vt_windows_rejects_console_mode_failures(self, monkeypatch):
+        monkeypatch.setattr(banner.sys, "platform", "win32")
+        _install_fake_ctypes(monkeypatch, _FakeCtypesKernel32(get_mode_ok=False))
+        assert banner._vt_windows() is False
+        _install_fake_ctypes(monkeypatch, _FakeCtypesKernel32(set_mode_ok=False))
+        assert banner._vt_windows() is False
+
+    def test_vt_windows_enables_vt_and_tolerates_cp_or_reconfigure_errors(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(banner.sys, "platform", "win32")
+        k32 = _FakeCtypesKernel32(cp_error=True)
+        _install_fake_ctypes(monkeypatch, k32)
+
+        class _Out(object):
+            encoding = "utf-8"
+
+            def reconfigure(self, **_k):
+                raise OSError("reconfigure failed")
+
+        monkeypatch.setattr(banner.sys, "stdout", _Out())
+        assert banner._vt_windows() is True
+        assert k32.set_cp_called is True
+
+    def test_vt_windows_skips_reconfigure_when_stdout_lacks_it(self, monkeypatch):
+        monkeypatch.setattr(banner.sys, "platform", "win32")
+        _install_fake_ctypes(monkeypatch, _FakeCtypesKernel32())
+
+        class _Out(object):
+            encoding = "cp65001"
+
+        monkeypatch.setattr(banner.sys, "stdout", _Out())
+        assert banner._vt_windows() is True
+
+    def test_vt_windows_returns_false_when_ctypes_is_unavailable(self, monkeypatch):
+        monkeypatch.setattr(banner.sys, "platform", "win32")
+
+        class _ExplodingKernel(object):
+            def GetStdHandle(self, _n):
+                raise OSError("no console")
+
+        _install_fake_ctypes(monkeypatch, _ExplodingKernel())
+        assert banner._vt_windows() is False
+
+    def test_isatty_and_term_cols_swallow_os_errors(self, monkeypatch):
+        class _BadOut(object):
+            def isatty(self):
+                raise OSError("closed")
+
+        monkeypatch.setattr(banner.sys, "stdout", _BadOut())
+        assert banner._isatty() is False
+        monkeypatch.setattr(
+            banner.shutil,
+            "get_terminal_size",
+            mock.Mock(side_effect=OSError("no tty")),
+        )
+        assert banner._term_cols() == 80
+
+    def test_color_bits_env_and_terminal_matrix(self, monkeypatch):
+        monkeypatch.setattr(banner, "_isatty", lambda: True)
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.delenv("COLORTERM", raising=False)
+        monkeypatch.delenv("TERM_PROGRAM", raising=False)
+        monkeypatch.delenv("WT_SESSION", raising=False)
+        monkeypatch.setenv("TERM", "xterm")
+
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert banner._color_bits() == 0
+        monkeypatch.delenv("NO_COLOR")
+
+        for value in ("0", "false", "False", "no"):
+            monkeypatch.setenv("FORCE_COLOR", value)
+            assert banner._color_bits() == 0
+        monkeypatch.delenv("FORCE_COLOR")
+
+        monkeypatch.setattr(banner, "_isatty", lambda: False)
+        assert banner._color_bits() == 0
+        monkeypatch.setattr(banner, "_isatty", lambda: True)
+
+        monkeypatch.setenv("TERM", "dumb")
+        assert banner._color_bits() == 0
+        monkeypatch.setenv("TERM", "xterm")
+
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        assert banner._color_bits() == 16
+        monkeypatch.setenv("FORCE_COLOR", "2")
+        assert banner._color_bits() == 256
+        monkeypatch.setenv("FORCE_COLOR", "3")
+        assert banner._color_bits() == 24
+        monkeypatch.delenv("FORCE_COLOR")
+
+        monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+        assert banner._color_bits() == 256
+        monkeypatch.delenv("TERM_PROGRAM")
+
+        monkeypatch.setenv("COLORTERM", "truecolor")
+        assert banner._color_bits() == 24
+        monkeypatch.setenv("COLORTERM", "24bit")
+        assert banner._color_bits() == 24
+        monkeypatch.delenv("COLORTERM")
+
+        monkeypatch.setenv("TERM_PROGRAM", "iTerm.app")
+        assert banner._color_bits() == 24
+        monkeypatch.delenv("TERM_PROGRAM")
+
+        monkeypatch.setenv("WT_SESSION", "uuid")
+        assert banner._color_bits() == 24
+        monkeypatch.delenv("WT_SESSION")
+
+        monkeypatch.setattr(banner.sys, "platform", "darwin")
+        assert banner._color_bits() == 24
+        monkeypatch.setattr(banner.sys, "platform", "freebsd")
+        monkeypatch.setenv("TERM", "xterm-256color")
+        assert banner._color_bits() == 256
+        monkeypatch.setenv("TERM", "vt100")
+        assert banner._color_bits() == 16
+
+    def test_half_block_falls_back_by_encoding_and_platform(self, monkeypatch):
+        class _Latin(object):
+            encoding = "latin-1"
+
+        monkeypatch.setattr(banner.sys, "stdout", _Latin())
+        monkeypatch.setattr(banner.sys, "platform", "darwin")
+        assert banner._use_half_block() is True
+        monkeypatch.setattr(banner.sys, "platform", "linux")
+        assert banner._use_half_block() is True
+        monkeypatch.setattr(banner.sys, "platform", "win32")
+        assert banner._use_half_block() is True
+        monkeypatch.setattr(banner.sys, "platform", "aix")
+        assert banner._use_half_block() is False
+
+        class _Utf8(object):
+            encoding = "UTF-8"
+
+        monkeypatch.setattr(banner.sys, "stdout", _Utf8())
+        assert banner._use_half_block() is True
+
+    def test_pixel_palette_and_cell_shapes(self):
+        assert banner._pix(-1, 0) == 0
+        assert banner._pix(0, -1) == 0
+        assert banner._pix(banner.HEIGHT, 0) == 0
+        assert banner._pix(0, banner.WIDTH) == 0
+        assert banner._pix(0, 0) == 0
+        assert banner._cell(0, 0, 0, True) == " "
+        assert banner._cell(1, 0, 0, False) == "#"
+        assert banner._cell(0, 2, 0, False) == "+"
+        assert banner._cell(0, 0, 16, False) == " "
+        assert banner._ASCII[1] in banner._cell(1, 0, 16, False)
+        assert banner._LOWER in banner._cell(0, 1, 24, True)
+        assert banner._UPPER in banner._cell(1, 0, 24, True)
+        assert banner._FULL in banner._cell(1, 1, 24, True)
+        mixed24 = banner._cell(1, 2, 24, True)
+        mixed256 = banner._cell(2, 1, 256, True)
+        mixed16 = banner._cell(1, 2, 16, True)
+        assert banner._UPPER in mixed24
+        assert "38;2;" in mixed24 and "48;2;" in mixed24
+        assert "38;5;" in mixed256 and "48;5;" in mixed256
+        assert mixed16.startswith("\033[")
+
+    def test_render_uses_detected_color_and_centers_on_wide_terminals(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(banner, "_color_bits", lambda: 16)
+        monkeypatch.setattr(banner, "_use_half_block", lambda: False)
+        monkeypatch.setattr(banner, "_term_cols", lambda: 120)
+        lines = banner.render_banner()
+        assert lines
+        assert lines[0].startswith(" ")
+        packed = banner.render_banner(bits=0, half=False, min_width=banner.WIDTH)
+        assert len(packed[0]) == banner.WIDTH
+
+    def test_print_banner_force_off_and_no_color_tty(self, monkeypatch, capsys):
+        monkeypatch.setenv("FORCE_COLOR", "no")
+        monkeypatch.setattr(banner, "_isatty", lambda: True)
+        banner.print_banner()
+        assert capsys.readouterr().out == ""
+
+        monkeypatch.delenv("FORCE_COLOR")
+        monkeypatch.setenv("NO_COLOR", "1")
+        monkeypatch.setattr(banner, "_term_cols", lambda: 120)
+        banner.print_banner()
+        out = capsys.readouterr().out
+        assert out
+        assert "SONAR" not in out
+        assert "\033[" not in out
+        assert "#" in out or "+" in out or "\u2580" in out or "\u2584" in out or "\u2588" in out
+
+    def test_print_banner_win32_without_vt_uses_plain_art(self, monkeypatch, capsys):
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(banner.sys, "platform", "win32")
+        monkeypatch.setattr(banner, "_isatty", lambda: True)
+        monkeypatch.setattr(banner, "_vt_windows", lambda: False)
+        monkeypatch.setattr(banner, "_term_cols", lambda: 120)
+        banner.print_banner()
+        out = capsys.readouterr().out
+        assert out
+        assert "\033[38;2;" not in out
+
+    def test_print_banner_narrow_console_uses_compact_line(self, monkeypatch, capsys):
+        monkeypatch.setenv("FORCE_COLOR", "3")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(banner, "_isatty", lambda: True)
+        monkeypatch.setattr(banner, "_vt_windows", lambda: True)
+        monkeypatch.setattr(banner, "_term_cols", lambda: banner.WIDTH)
+        banner.print_banner()
+        out = capsys.readouterr().out
+        assert "SONAR" in out
+        assert ")))" in out
+
+    def test_print_compact_plain_text(self, capsys):
+        banner._print_compact(0)
+        out = capsys.readouterr().out
+        assert "SONAR" in out
+        assert "\033[" not in out
+
+    def test_print_banner_unicode_error_falls_back_to_ascii(self, monkeypatch):
+        monkeypatch.setenv("FORCE_COLOR", "3")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(banner, "_isatty", lambda: True)
+        monkeypatch.setattr(banner, "_vt_windows", lambda: True)
+        monkeypatch.setattr(banner, "_term_cols", lambda: 120)
+        err = UnicodeEncodeError("utf-8", "x", 0, 1, "nope")
+        out = _RecordingStdout()
+        calls = {"n": 0}
+
+        def write(data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise err
+            out.writes.append(data)
+            return len(data)
+
+        out.write = write
+        monkeypatch.setattr(banner.sys, "stdout", out)
+        banner.print_banner()
+        blob = "".join(out.writes)
+        assert blob
+        assert "#" in blob or "+" in blob or " " in blob
+
+    def test_print_banner_swallows_write_failures(self, monkeypatch):
+        monkeypatch.setenv("FORCE_COLOR", "3")
+        monkeypatch.setattr(banner, "_isatty", lambda: True)
+        monkeypatch.setattr(banner, "_term_cols", lambda: 120)
+        out = _RecordingStdout(fail=RuntimeError("broken pipe"))
+        monkeypatch.setattr(banner.sys, "stdout", out)
+        banner.print_banner()
+
+        out2 = _RecordingStdout(fail=UnicodeEncodeError("utf-8", "x", 0, 1, "nope"))
+        monkeypatch.setattr(banner.sys, "stdout", out2)
+        banner.print_banner()
+
+    def test_print_compact_swallows_write_failures(self, monkeypatch):
+        out = _RecordingStdout(fail=OSError("closed"))
+        monkeypatch.setattr(banner.sys, "stdout", out)
+        banner._print_compact(24)
+        banner._print_compact(0)
+
+
+class TestRunVersionFetchGaps:
+    def test_parse_version_comments_only(self):
+        assert run._parse_version_text("# only\n\n  \n# still") == ""
+
+    def test_newest_version_skips_unparseable_values(self):
+        assert run._newest_version(["", "nope", "1.0.0", "0.9", "not"]) == "1.0.0"
+        assert run._newest_version(["bad", ""]) == ""
+
+    def test_fetch_one_version_empty_url_and_oversize_body(self, monkeypatch):
+        assert run._fetch_one_version("", 1) == ""
+        assert run._fetch_one_version("   ", 1) == ""
+
+        class _Resp(object):
+            def read(self, n=-1):
+                return b"x" * 65
+
+            def close(self):
+                raise OSError("close failed")
+
+        monkeypatch.setattr(run.urllib.request, "urlopen", lambda *a, **k: _Resp())
+        assert run._fetch_one_version("https://ok.example/v", 1) == ""
+
+        class _Empty(object):
+            def read(self, n=-1):
+                return b""
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(run.urllib.request, "urlopen", lambda *a, **k: _Empty())
+        assert run._fetch_one_version("https://ok.example/v", 1) == ""
+
+    def test_fetch_latest_uses_defaults_and_ignores_blank_urls(self, monkeypatch):
+        class _Resp(object):
+            def read(self, n=-1):
+                return b"9.9.9\n"
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(run.urllib.request, "urlopen", lambda *a, **k: _Resp())
+        monkeypatch.setattr(run, "VERSION_CHECK_URLS", ["https://ok.example/v"])
+        monkeypatch.setattr(run, "VERSION_CHECK_TIMEOUT", 1)
+        assert run._fetch_latest_version() == "9.9.9"
+        assert run._fetch_latest_version(urls=["", None, "  "]) == ""
+
+    def test_fetch_latest_ignores_worker_exceptions(self, monkeypatch):
+        def boom(*_a, **_k):
+            raise RuntimeError("worker exploded")
+
+        monkeypatch.setattr(run, "_fetch_one_version", boom)
+        assert run._fetch_latest_version(urls=["https://x.example/v"], timeout=1) == ""
+
+
+class TestMissingOptionalDnsProbeImport:
+    def test_run_py_sets_dns_probe_none_when_import_fails(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "dns_probe", None)
+        name = "run_missing_dns_probe_cov"
+        spec = importlib.util.spec_from_file_location(name, ROOT / "run.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        try:
+            assert spec.loader is not None
+            spec.loader.exec_module(mod)
+            assert mod.dns_probe is None
+        finally:
+            sys.modules.pop(name, None)
+
+    def test_send_results_sets_dns_probe_none_when_import_fails(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "dns_probe", None)
+        name = "send_results_missing_dns_probe_cov"
+        spec = importlib.util.spec_from_file_location(name, APP / "send_results.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        try:
+            assert spec.loader is not None
+            spec.loader.exec_module(mod)
+            assert mod.dns_probe is None
+        finally:
+            sys.modules.pop(name, None)
+
+
+def _make_prober(transport=None, domains=None, resolvers=None, **kwargs):
+    kwargs.setdefault("timeout", 0.2)
+    kwargs.setdefault("attempts", 2)
+    kwargs.setdefault("qps_by_kind", {"global": 500.0, "russian": 500.0, "nsdi": 500.0})
+    kwargs.setdefault("max_inflight", 10)
+    kwargs.setdefault("max_inflight_per_server", 10)
+    kwargs.setdefault("breaker_failures", 15)
+    kwargs.setdefault("max_seconds", 60.0)
+    kwargs.setdefault("stop_event", None)
+    kwargs.setdefault("progress", None)
+    kwargs.setdefault("clock", _FakeClock())
+    return dns_probe._Prober(
+        domains=domains or ["example.com"],
+        resolvers=resolvers or [_mkres("a", "1.1.1.1")],
+        transport=transport or _FakeTransport(),
+        **kwargs
+    )
+
+
+class TestDnsProbeRemainingBranches:
+    def test_family_of_skips_ipv6_when_the_host_has_none(self, monkeypatch):
+        monkeypatch.setattr(dns_probe.socket, "has_ipv6", False)
+        assert dns_probe._family_of("2001:db8::1") is None
+        assert dns_probe.parse_resolver_line("x,2001:db8::1,global") is None
+
+    def test_normalize_ip_returns_the_original_on_failure(self):
+        assert dns_probe.normalize_ip("not-an-ip", socket.AF_INET) == "not-an-ip"
+
+    def test_encode_qname_rejects_a_name_over_255_bytes(self):
+        too_long = ".".join(["a"] * 128)
+        with pytest.raises(ValueError, match="name too long"):
+            dns_probe.encode_qname(too_long)
+
+    def test_read_qname_truncated_and_overlong(self):
+        question = dns_probe.question_key("example.com")
+        header = struct.pack(">HHHHHH", 0x4242, 0x8180, 1, 0, 0, 0)
+        assert dns_probe.parse_response(header, 0x4242, question) is None
+        # Label claims more bytes than remain.
+        truncated = header + b"\x05ab"
+        assert dns_probe.parse_response(truncated, 0x4242, question) is None
+        # Many one-byte labels so the running total exceeds 255.
+        labels = b"".join(b"\x01a" for _ in range(130)) + b"\x00" + struct.pack(">HH", 1, 1)
+        overlong = header + labels
+        assert dns_probe.parse_response(overlong, 0x4242, question) is None
+
+    def test_skip_name_uncompressed_and_truncated(self):
+        q = dns_probe.build_query(dns_probe.encode_qname("example.com"), 0x4242)
+        qname = dns_probe.encode_qname("example.com")
+        header = struct.pack(">HHHHHH", 0x4242, 0x8180, 1, 1, 0, 0)
+        answer = qname + struct.pack(">HHIH", 1, 1, 60, 4) + bytes([1, 2, 3, 4])
+        rcode, ips = dns_probe.parse_response(
+            header + q[12:] + answer, 0x4242, dns_probe.question_key("example.com")
+        )
+        assert (rcode, ips) == (0, ["1.2.3.4"])
+
+        # ancount=1 but the packet ends at the header: offset >= len(data).
+        empty_answers = struct.pack(">HHHHHH", 0x4242, 0x8180, 0, 1, 0, 0)
+        parsed = dns_probe.parse_response(
+            empty_answers, 0x4242, dns_probe.question_key("example.com")
+        )
+        assert parsed == (0, [])
+
+        # Compression pointer, then fewer than 10 bytes of RR header.
+        short_rr = struct.pack(">HHHHHH", 0x4242, 0x8180, 0, 1, 0, 0) + b"\xc0\x0c\x00"
+        parsed = dns_probe.parse_response(
+            short_rr, 0x4242, dns_probe.question_key("example.com")
+        )
+        assert parsed == (0, [])
+
+        # Uncompressed label that runs off the end of the packet.
+        runaway = struct.pack(">HHHHHH", 0x4242, 0x8180, 0, 1, 0, 0) + b"\x05ab"
+        parsed = dns_probe.parse_response(
+            runaway, 0x4242, dns_probe.question_key("example.com")
+        )
+        assert parsed == (0, [])
+
+    def test_same_answer_conflict_rules(self):
+        def ok_then_nx(data):
+            return [_dns_reply(data, ips=["1.2.3.4"]), _dns_reply(data, rcode=3)]
+
+        def two_nx(data):
+            return [_dns_reply(data, rcode=3), _dns_reply(data, rcode=3)]
+
+        resolvers = [_mkres("a", "1.1.1.1")]
+        different = _probe(
+            ["example.com"], resolvers, _FakeTransport(plan={"1.1.1.1": ok_then_nx})
+        )
+        assert different.conflicts == 1
+        same_nx = _probe(
+            ["example.com"], resolvers, _FakeTransport(plan={"1.1.1.1": two_nx})
+        )
+        assert same_nx.conflicts == 0
+        assert same_nx.by_domain["example.com"]["a"].code == dns_probe.CODE_NXDOMAIN
+
+    def test_late_garbage_and_unknown_txid_are_unmatched(self):
+        class Extra(_FakeTransport):
+            def send(self, family, data, address):
+                _FakeTransport.send(self, family, data, address)
+                # Same source, unknown tx id.
+                self.inbox.append((family, b"\x00\x00" + data[2:], (address[0], 53)))
+
+        def ok_then_query(data):
+            return [_dns_reply(data, ips=["1.1.1.1"]), data]
+
+        resolvers = [_mkres("a", "1.1.1.1")]
+        unknown = _probe(
+            ["example.com"], resolvers, Extra(addresses={"1.1.1.1": ["1.1.1.1"]})
+        )
+        assert unknown.unmatched >= 1
+        garbage = _probe(
+            ["example.com"],
+            resolvers,
+            _FakeTransport(plan={"1.1.1.1": ok_then_query}),
+        )
+        assert garbage.unmatched >= 1
+        assert garbage.conflicts == 0
+
+    def test_retry_backpressure_and_global_inflight_cap(self):
+        class DropThenBlock(_FakeTransport):
+            def send(self, family, data, address):
+                if len(self.sent) >= 1:
+                    self.sent.append((address[0], data))
+                    raise BlockingIOError("retry would block")
+                self.sent.append((address[0], data))
+
+        resolvers = [_mkres("a", "1.1.1.1")]
+        blocked = _probe(
+            ["example.com"],
+            resolvers,
+            DropThenBlock(),
+            attempts=3,
+            timeout=0.05,
+            clock=_FakeClock(step=0.05),
+        )
+        assert blocked.by_domain["example.com"]["a"].code in (
+            dns_probe.CODE_TIMEOUT,
+            dns_probe.CODE_OK,
+        )
+
+        two = [_mkres("a", "1.1.1.1"), _mkres("b", "9.9.9.9")]
+        transport = _FakeTransport(plan={"1.1.1.1": "drop", "9.9.9.9": "drop"})
+        capped = _probe(
+            ["d0.test", "d1.test", "d2.test"],
+            two,
+            transport,
+            attempts=1,
+            max_inflight=1,
+            max_inflight_per_server=10,
+            breaker_failures=10 ** 6,
+            timeout=0.05,
+            clock=_FakeClock(step=0.05),
+        )
+        assert capped.queries_done >= 1
+
+    def test_progress_reports_during_a_long_run(self):
+        seen = []
+        resolvers = [_mkres("a", "1.1.1.1")]
+        _probe(
+            ["d{}.test".format(i) for i in range(8)],
+            resolvers,
+            _FakeTransport(plan={"1.1.1.1": "drop"}),
+            attempts=1,
+            timeout=0.2,
+            max_seconds=40.0,
+            breaker_failures=10 ** 6,
+            progress=lambda done, total: seen.append((done, total)),
+            clock=_FakeClock(step=3.0),
+        )
+        assert len(seen) >= 2
+
+    def test_tx_id_falls_back_after_repeated_collisions(self, monkeypatch):
+        prober = _make_prober()
+        prober.txmap[(0, 7)] = object()
+        monkeypatch.setattr(dns_probe._rng, "getrandbits", lambda _n: 7)
+        assert prober._new_tx_id(0) == 7
+
+    def test_refill_ignores_non_positive_elapsed(self):
+        prober = _make_prober()
+        prober.last_fill[0] = 10.0
+        before = prober.tokens[0]
+        prober._refill(0, 10.0)
+        prober._refill(0, 9.0)
+        assert prober.tokens[0] == before
+
+    def test_queues_drained_sees_pending_retries(self):
+        prober = _make_prober()
+        prober.retry_queue[0].append(object())
+        assert prober._queues_drained() is False
+
+    def test_settle_is_idempotent_and_finalize_ignores_stale_indexes(self):
+        prober = _make_prober()
+        pending = dns_probe._Pending("example.com", b"\x00", b"", 0, 0.0)
+        prober.active[(0, "example.com")] = pending
+        prober.inflight_n[0] = 1
+        prober._settle(pending, dns_probe.CODE_OK, ("1.1.1.1",), 1.0)
+        prober._settle(pending, dns_probe.CODE_TIMEOUT, (), 2.0)
+        assert prober.by_domain["example.com"]["a"].code == dns_probe.CODE_OK
+        prober.conflicted.add((99, "nope"))
+        prober._finalize()
+
+    def test_sweep_drops_expired_transaction_ids(self):
+        prober = _make_prober()
+        prober.recent[(0, 1)] = ("example.com", 0.5)
+        prober._last_sweep = 0.0
+        prober._sweep_recent(10.0)
+        assert (0, 1) not in prober.recent
+
+    def test_breaker_settles_retries_still_in_the_queue(self):
+        class FailAfterWarmup(_FakeTransport):
+            def send(self, family, data, address):
+                n = len(self.sent)
+                self.sent.append((address[0], data))
+                if n >= 3:
+                    raise OSError("resolver vanished")
+
+        result = _probe(
+            ["a.test", "b.test", "c.test"],
+            [_mkres("a", "1.1.1.1")],
+            FailAfterWarmup(),
+            attempts=2,
+            breaker_failures=2,
+            max_inflight_per_server=3,
+            max_inflight=3,
+            timeout=0.05,
+            clock=_FakeClock(step=0.05),
+        )
+        assert result.dead == ("a",)
+        codes = [
+            result.by_domain[name]["a"].code
+            for name in ("a.test", "b.test", "c.test")
+            if "a" in result.by_domain.get(name, {})
+        ]
+        assert codes
+        assert set(codes) <= {dns_probe.CODE_ERROR, dns_probe.CODE_TIMEOUT}
+
+    def test_parse_roster_skips_empty_slug_or_ip(self):
+        assert dns_probe.parse_roster("=1.1.1.1/global") == []
+        assert dns_probe.parse_roster("slug=/global") == []
+        assert dns_probe.parse_roster("slug= /global") == []
+
+    def test_udp_transport_open_reuse_and_ipv6(self):
+        transport = dns_probe.UdpTransport()
+        try:
+            ok_v4 = transport.open(socket.AF_INET)
+            if ok_v4:
+                assert transport.open(socket.AF_INET) is True
+            if getattr(socket, "has_ipv6", False):
+                ok_v6 = transport.open(socket.AF_INET6)
+                if ok_v6:
+                    assert transport.open(socket.AF_INET6) is True
+        finally:
+            transport.close()
+
+    def test_udp_transport_ipv6_setsockopt_failure_is_ignored(self, monkeypatch):
+        if not getattr(socket, "has_ipv6", False):
+            pytest.skip("host has no IPv6")
+        real_socket = socket.socket
+
+        class _Sock(object):
+            def __init__(self, sock):
+                self._sock = sock
+
+            def setsockopt(self, *a, **k):
+                raise OSError("no IPV6_V6ONLY")
+
+            def setblocking(self, *a, **k):
+                return self._sock.setblocking(*a, **k)
+
+            def close(self):
+                return self._sock.close()
+
+            def fileno(self):
+                return self._sock.fileno()
+
+            def __getattr__(self, name):
+                return getattr(self._sock, name)
+
+        def wrapping(family, typ, *a, **k):
+            sock = real_socket(family, typ, *a, **k)
+            if family == socket.AF_INET6:
+                return _Sock(sock)
+            return sock
+
+        transport = dns_probe.UdpTransport()
+        monkeypatch.setattr(dns_probe.socket, "socket", wrapping)
+        try:
+            assert transport.open(socket.AF_INET6) is True
+        finally:
+            transport.close()
+
+    def test_udp_transport_error_paths(self, monkeypatch):
+        transport = dns_probe.UdpTransport()
+        monkeypatch.setattr(
+            dns_probe.socket, "socket", mock.Mock(side_effect=OSError("no udp"))
+        )
+        assert transport.open(socket.AF_INET) is False
+
+        transport = dns_probe.UdpTransport()
+        with pytest.raises(OSError, match="no socket"):
+            transport.send(socket.AF_INET, b"x", ("1.1.1.1", 53))
+
+        monkeypatch.setattr(dns_probe.time, "sleep", lambda _s: None)
+        assert dns_probe.UdpTransport().poll(0.01) == []
+
+        transport = dns_probe.UdpTransport()
+        transport._socks[socket.AF_INET] = mock.Mock()
+        transport._selector.select = mock.Mock(side_effect=OSError("select"))
+        assert transport.poll(0.01) == []
+
+        sock = mock.Mock()
+        sock.recvfrom.side_effect = OSError("recv failed")
+        transport = dns_probe.UdpTransport()
+        orig = transport._selector
+        key = mock.Mock()
+        key.fileobj = sock
+        key.data = socket.AF_INET
+        transport._selector = mock.Mock()
+        transport._selector.select.return_value = [(key, 1)]
+        transport._socks[socket.AF_INET] = sock
+        try:
+            assert transport.poll(0.01) == []
+        finally:
+            try:
+                orig.close()
+            except (OSError, ValueError):
+                pass
+
+        transport = dns_probe.UdpTransport()
+        transport._selector.close = mock.Mock(side_effect=OSError("sel close"))
+        bad_sock = mock.Mock()
+        bad_sock.close.side_effect = OSError("sock close")
+        transport._socks[socket.AF_INET] = bad_sock
+        transport.close()
+
+    def test_udp_transport_register_failure_closes_the_socket(self, monkeypatch):
+        sock = mock.Mock()
+        sock.close.side_effect = OSError("already closed")
+        monkeypatch.setattr(dns_probe.socket, "socket", lambda *a, **k: sock)
+        transport = dns_probe.UdpTransport()
+        transport._selector.register = mock.Mock(side_effect=OSError("register"))
+        assert transport.open(socket.AF_INET) is False
+
