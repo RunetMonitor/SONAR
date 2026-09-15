@@ -358,7 +358,7 @@ def _fetch_one_version(url, timeout):
     resp = None
     try:
         req = urllib.request.Request(
-            url, headers={"User-Agent": "WhiteListChecker"}
+            url, headers={"User-Agent": "SONAR"}
         )
         resp = urllib.request.urlopen(req, timeout=timeout)
         body = resp.read(65)
@@ -420,7 +420,7 @@ def _print_update_notice(local, remote):
     )
     print(
         "ASK NASVYAZI HELPDESK (NASVYAZI.ORG) OR SEE "
-        "GITHUB.COM/RUNETMONITOR/WHITELISTCHECKERSCRIPT"
+        "GITHUB.COM/RUNETMONITOR/SONAR"
     )
     print()
 
@@ -944,7 +944,7 @@ def main():
             )
             pause_if_windows()
             sys.exit(1)
-        print("Domain Checker - SKIP_CHECK (send only / re-send)")
+        print("SONAR - SKIP_CHECK (send only / re-send)")
         print("=" * 55)
         print("  CSV        : {}".format(out_path))
         if resolve_meta == "latest":
@@ -978,7 +978,7 @@ def main():
     # Lookup may return public IP for console debug only; never persist it.
     location, isp, _ip_address = detect_location()
 
-    print("Domain Checker")
+    print("SONAR")
     print("=" * 55)
     if location:
         print("  Location   : {}".format(location))

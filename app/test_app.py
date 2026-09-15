@@ -1,4 +1,4 @@
-"""Single pytest suite for WhiteListCheckerScript (run.py + app/*)."""
+"""Single pytest suite for SONAR (run.py + app/*)."""
 
 from __future__ import annotations
 
@@ -343,7 +343,7 @@ class TestVersionCheck:
         assert "A NEWER VERSION OF THIS SCRIPT IS AVAILABLE (1.3.0). YOU HAVE 1.2.0." in out
         assert out.strip() == out.strip().upper()
         assert "NASVYAZI.ORG" in out
-        assert "GITHUB.COM/RUNETMONITOR/WHITELISTCHECKERSCRIPT" in out
+        assert "GITHUB.COM/RUNETMONITOR/SONAR" in out
 
     def test_notice_silent_when_same_or_older_or_missing(self, capsys):
         run._print_update_notice("1.3.0", "1.3.0")
@@ -1963,7 +1963,7 @@ class TestRunMainFlows:
         monkeypatch.setattr(run, "_read_version_text", lambda *_a: "9.9.9")
         run.main()
         out = capsys.readouterr().out
-        assert "Domain Checker" in out
+        assert "SONAR" in out
         assert "Local-only" in out or "local" in out.lower()
         out_csv = tmp_path / "results" / "check_results_test.csv"
         assert out_csv.is_file()
