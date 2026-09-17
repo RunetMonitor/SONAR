@@ -24,6 +24,7 @@ import io
 import json
 import re
 import secrets
+import ssl
 import struct
 import sys
 import urllib.error
@@ -33,8 +34,6 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-import requests
 
 _APP_DIR = Path(__file__).resolve().parent
 _ROOT_DIR = _APP_DIR.parent
@@ -421,26 +420,62 @@ def _hop_url(hop: Dict[str, Any]) -> str:
     )
 
 
+class _HttpResponse:
+    """Minimal response object so hop handling can print JSON or text."""
+
+    def __init__(self, status_code: int, body: str) -> None:
+        self.status_code = status_code
+        self.text = body
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status_code < 300
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+
+def _ssl_context(verify: bool) -> Optional[ssl.SSLContext]:
+    if verify:
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _post_receiver_hop(
     hop: Dict[str, Any],
     upload_filename: str,
     zip_bytes: bytes,
     web_token: str,
-) -> Tuple[int, Optional["requests.Response"]]:
+) -> Tuple[int, Optional[_HttpResponse]]:
     url = _hop_url(hop)
-    headers: Dict[str, str] = {"X-Web-Token": web_token}
+    body, ct = _zip_multipart_body(zip_bytes, upload_filename)
+    headers = {
+        "X-Web-Token": web_token,
+        "User-Agent": "DomainChecker/1.0",
+        "Accept": "*/*",
+        "Content-Type": ct,
+    }
     timeout = float(hop.get("timeout_sec", 300.0))
     verify = not bool(hop.get("insecure_tls", False))
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
-        response = requests.post(
-            url,
-            files={"file": (upload_filename, zip_bytes, "application/zip")},
-            headers=headers,
-            timeout=timeout,
-            verify=verify,
-        )
-    except requests.RequestException as exc:
-        print("error: hop request failed: {}".format(exc), file=sys.stderr)
+        with urllib.request.urlopen(
+            req, timeout=timeout, context=_ssl_context(verify)
+        ) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            response = _HttpResponse(resp.getcode(), text)
+    except urllib.error.HTTPError as e:
+        err = ""
+        try:
+            err = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            err = str(e.reason or "")
+        response = _HttpResponse(e.code, err)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        print("error: hop request failed: {}".format(e), file=sys.stderr)
         return 1, None
     return (0 if response.ok else 1), response
 
