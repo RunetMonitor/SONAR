@@ -8,6 +8,7 @@ import io
 import json
 import os
 import socket
+import ssl
 import struct
 import sys
 import urllib.error
@@ -893,16 +894,29 @@ class TestSendResultsUpload:
         assert "403" in msg
 
     def test_post_receiver_hop_ok(self, monkeypatch):
-        class FakeResponse:
-            ok = True
-            status_code = 200
-            text = '{"ok":true}'
+        seen = {}
 
-            def json(self):
-                return {"ok": True}
+        class FakeResp:
+            def getcode(self):
+                return 200
 
-        post = mock.Mock(return_value=FakeResponse())
-        monkeypatch.setattr(sr.requests, "post", post)
+            def read(self):
+                return b'{"ok":true}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None, context=None):
+            seen["headers"] = dict(req.headers)
+            seen["timeout"] = timeout
+            seen["context"] = context
+            seen["data"] = req.data
+            return FakeResp()
+
+        monkeypatch.setattr(sr.urllib.request, "urlopen", fake_urlopen)
         hop = {
             "host": "203.0.113.1",
             "port": 5000,
@@ -916,22 +930,112 @@ class TestSendResultsUpload:
         )
         assert code == 0
         assert resp is not None and resp.ok
-        headers = post.call_args.kwargs["headers"]
-        assert headers.get("X-Web-Token") == upload_token.SHARED_VALID_TOKEN
-        assert "X-Auth-Token" not in headers
+        assert resp.json() == {"ok": True}
+        headers = seen["headers"]
+        assert seen["timeout"] == 10.0
+        assert seen["context"] is None
+        assert b"zip" in seen["data"]
+        assert (
+            headers.get("X-web-token") == upload_token.SHARED_VALID_TOKEN
+            or headers.get("X-Web-Token") == upload_token.SHARED_VALID_TOKEN
+        )
+        header_names = {k.lower() for k in headers}
+        assert "x-auth-token" not in header_names
+
+    def test_post_receiver_hop_http_error(self, monkeypatch):
+        def boom(*a, **k):
+            raise urllib.error.HTTPError(
+                "http://203.0.113.1:5000/upload",
+                500,
+                "Server Error",
+                hdrs=None,
+                fp=io.BytesIO(b"fail"),
+            )
+
+        monkeypatch.setattr(sr.urllib.request, "urlopen", boom)
+        hop = {"host": "203.0.113.1", "port": 5000, "scheme": "http", "path": "/upload"}
+        code, resp = sr._post_receiver_hop(
+            hop, "f.zip", b"zip", upload_token.SHARED_VALID_TOKEN
+        )
+        assert code == 1
+        assert resp is not None
+        assert not resp.ok
+        assert resp.status_code == 500
+        assert "fail" in resp.text
+
+    def test_post_receiver_hop_http_error_read_fails(self, monkeypatch):
+        class BadHTTPError(urllib.error.HTTPError):
+            def read(self, *a, **k):
+                raise OSError("no body")
+
+        def boom(*a, **k):
+            raise BadHTTPError(
+                "http://203.0.113.1:5000/upload",
+                502,
+                "Bad Gateway",
+                hdrs=None,
+                fp=None,
+            )
+
+        monkeypatch.setattr(sr.urllib.request, "urlopen", boom)
+        hop = {"host": "203.0.113.1", "port": 5000, "scheme": "http", "path": "/upload"}
+        code, resp = sr._post_receiver_hop(
+            hop, "f.zip", b"zip", upload_token.SHARED_VALID_TOKEN
+        )
+        assert code == 1
+        assert resp is not None
+        assert not resp.ok
+        assert resp.status_code == 502
+        assert "Bad Gateway" in resp.text
 
     def test_post_receiver_hop_request_error(self, monkeypatch):
-        monkeypatch.setattr(
-            sr.requests,
-            "post",
-            mock.Mock(side_effect=sr.requests.RequestException("boom")),
-        )
+        def boom(*a, **k):
+            raise urllib.error.URLError("boom")
+
+        monkeypatch.setattr(sr.urllib.request, "urlopen", boom)
         hop = {"host": "203.0.113.1", "port": 5000, "scheme": "http", "path": "/upload"}
         code, resp = sr._post_receiver_hop(
             hop, "f.zip", b"zip", upload_token.SHARED_VALID_TOKEN
         )
         assert code == 1
         assert resp is None
+
+    def test_post_receiver_hop_insecure_tls(self, monkeypatch):
+        seen = {}
+
+        class FakeResp:
+            def getcode(self):
+                return 200
+
+            def read(self):
+                return b"{}"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None, context=None):
+            seen["context"] = context
+            return FakeResp()
+
+        monkeypatch.setattr(sr.urllib.request, "urlopen", fake_urlopen)
+        hop = {
+            "host": "203.0.113.1",
+            "port": 443,
+            "scheme": "https",
+            "path": "/upload",
+            "insecure_tls": True,
+        }
+        code, resp = sr._post_receiver_hop(
+            hop, "f.zip", b"zip", upload_token.SHARED_VALID_TOKEN
+        )
+        assert code == 0
+        assert resp is not None and resp.ok
+        assert seen["context"] is not None
+        assert seen["context"].check_hostname is False
+        assert seen["context"].verify_mode == ssl.CERT_NONE
 
     def test_try_receiver_hops_tries_in_order(self, monkeypatch):
         calls = []
