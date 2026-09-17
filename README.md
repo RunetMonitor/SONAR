@@ -9,8 +9,7 @@ License: MIT (see LICENSE)
 https://github.com/RunetMonitor/SONAR
 
 Required:  
-Python 3.6 or newer  
-(optional for upload: the requests package - pip install requests)
+Python 3.6 or newer
 
 ========
 
@@ -64,6 +63,11 @@ same CSV (dns_probe_* columns).
 Re-send an existing CSV (no re-scan)
 
 If upload failed after a finished scan, or you ran local-only first:
+
+`python3 app/send_results.py`
+
+That uses the newest `results/check_results_*.csv` (by last-modified time).  
+To send a specific file instead:
 
 `python3 app/send_results.py results/check_results_YYYYMMDD_HHMMSS.csv`
 
