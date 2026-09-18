@@ -2,6 +2,15 @@ SONAR - release notes
 
 ========
 
+1.3.5
+
+Each scan writes an anonymous sonar_id (random string) into the CSV (and upload). A local
+.sonar file in the script folder remembers the id for this machine on the
+same public IP. Changing network/IP gets a new id. Do not send .sonar to
+Helpdesk. Older volunteer scripts without this column still upload.
+
+========
+
 1.3.4
 
 Each site is now checked over IPv4 and IPv6 separately. Original CSV

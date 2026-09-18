@@ -57,6 +57,9 @@ What happens when you run
 5. Auth is only that one-time token (used as the zip password and as  
    X-Web-Token). No zip password in the package. Do not edit config.py.
 
+The script may create a local `.sonar` file in this folder. Keep it; do  
+not send it to Helpdesk (send only the CSV). It is not an IP address.
+
 ========
 
 The scan also queries extra DNS servers listed in app/dns_servers.txt.  

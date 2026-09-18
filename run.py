@@ -15,10 +15,12 @@ require_runtime()
 import csv
 import glob
 import hashlib
+import hmac
 import http.client
 import json
 import random
 import re
+import secrets
 import socket
 import ssl
 import struct
@@ -188,7 +190,12 @@ RESULT_CSV_BASE_COLUMNS = (
     "check_location",
     "check_provider",
     "check_version",
+    "sonar_id",
 )
+
+# Local anonymous install id. Never commit; never send the hashed-IP field.
+SONAR_FILE_NAME = ".sonar"
+SONAR_ID_HEX_LEN = 64
 
 
 def result_csv_fieldnames(include_dns_probe=True):
@@ -1036,6 +1043,119 @@ def detect_location(timeout=5):
         pass
     return "", "", ""
 
+
+def _is_hex_string(value, length):
+    if not value or len(value) != length:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _hmac_public_ip(sonar_id, public_ip):
+    return hmac.new(
+        sonar_id.encode("ascii"),
+        public_ip.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _hex_eq(left, right):
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    if len(left) != len(right):
+        return False
+    try:
+        return hmac.compare_digest(left.lower(), right.lower())
+    except (TypeError, ValueError):
+        return False
+
+
+def _sonar_file_path(script_dir):
+    return os.path.join(script_dir, SONAR_FILE_NAME)
+
+
+def _read_sonar_file(path):
+    """Return (sonar_id, ip_hmac) or (None, None) if missing/invalid."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            line = fh.readline()
+    except OSError:
+        return None, None
+    parts = line.strip().split()
+    if not parts:
+        return None, None
+    sonar_id = parts[0]
+    stored_hmac = parts[1] if len(parts) > 1 else ""
+    if not _is_hex_string(sonar_id, SONAR_ID_HEX_LEN):
+        return None, None
+    if stored_hmac and not _is_hex_string(stored_hmac, 64):
+        stored_hmac = ""
+    return sonar_id, stored_hmac
+
+
+def _write_sonar_file(path, sonar_id, ip_hmac):
+    line = sonar_id
+    if ip_hmac:
+        line = "{} {}".format(sonar_id, ip_hmac)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(line)
+            fh.write("\n")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def resolve_sonar_id(script_dir, public_ip):
+    """Stable anonymous id for this machine on this public IP.
+
+    File format: ``<64-hex-id> <hmac-sha256(id, public_ip)>``.
+    CSV/upload get only the id. Same public IP keeps the id; a new IP
+    rotates it. Missing public IP keeps an existing id and does not rotate.
+    """
+    path = _sonar_file_path(script_dir)
+    sonar_id, stored_hmac = _read_sonar_file(path)
+    public_ip = (public_ip or "").strip()
+
+    if sonar_id:
+        if not public_ip:
+            return sonar_id
+        expected = _hmac_public_ip(sonar_id, public_ip)
+        if stored_hmac:
+            if _hex_eq(stored_hmac, expected):
+                return sonar_id
+        else:
+            try:
+                _write_sonar_file(path, sonar_id, expected)
+            except OSError:
+                pass
+            return sonar_id
+
+    sonar_id = secrets.token_hex(32)
+    ip_hmac = _hmac_public_ip(sonar_id, public_ip) if public_ip else ""
+    try:
+        _write_sonar_file(path, sonar_id, ip_hmac)
+    except OSError:
+        pass
+    return sonar_id
+
+
 def get_system_dns_servers():
     servers = []
 
@@ -1516,6 +1636,8 @@ def main():
 
     results.sort(key=lambda r: (r["source_file"], r["domain"]))
 
+    sonar_id = resolve_sonar_id(script_dir, _ip_address)
+
     os.makedirs(results_dir, exist_ok=True)
     out_path = os.path.join(results_dir, OUTPUT_CSV)
     with open(out_path, "w", newline="", encoding="utf-8") as fh:
@@ -1530,6 +1652,8 @@ def main():
                     probe_result.resolvers
                 )
                 results[0]["dns_probe_meta"] = dns_probe.format_meta(probe_result)
+            for row in results:
+                row["sonar_id"] = sonar_id
         w.writerows(results)
 
     yes = sum(1 for r in results if r["accessible"] == "YES")
