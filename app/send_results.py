@@ -350,6 +350,26 @@ def _resolve_csv_path() -> Path:
     return Path(paths[0])
 
 
+def _ipv6_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """IPv6 verdicts only; omitted entirely for older CSVs with no such column."""
+    counts = {"YES": 0, "PARTIAL": 0, "NO": 0, "ERROR": 0}
+    measured = 0
+    for row in rows:
+        value = row.get("accessible_ipv6", "")
+        if value in counts:
+            counts[value] += 1
+            measured += 1
+    if not measured:
+        return {}
+    return {
+        "accessible": counts["YES"],
+        "partial": counts["PARTIAL"],
+        "blocked_down": counts["NO"],
+        "errors": counts["ERROR"],
+        "measured": measured,
+    }
+
+
 def _probe_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     roster = ""
     meta = ""
@@ -400,6 +420,9 @@ def _build_payload(rows: List[Dict[str, Any]], csv_path: Path) -> Dict[str, Any]
     probe_summary = _probe_summary(rows)
     if probe_summary:
         result_data["dns_probe"] = probe_summary
+    ipv6_summary = _ipv6_summary(rows)
+    if ipv6_summary:
+        result_data["ipv6"] = ipv6_summary
 
     # Omit end-user ip_address from upload. Region is sanitized (no public IP suffix).
     return {

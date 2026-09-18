@@ -27,6 +27,7 @@ _UPPER = "\u2580"  # ▀
 _LOWER = "\u2584"  # ▄
 _FULL = "\u2588"  # █
 _RESET = "\033[0m"
+_BOLD = "\033[1m"
 
 # '.' transparent  '#' letter  '+' sage  — even height for half-blocks
 _BITMAP = """\
@@ -254,6 +255,19 @@ def render_banner(bits=None, half=None, min_width=None):
         prefix = " " * pad
         lines = [prefix + ln for ln in lines]
     return lines
+
+
+def bold(text):
+    """Wrap text in ANSI bold when the terminal can show it; else return as-is.
+
+    Uses the same color/VT checks as the splash: NO_COLOR, dumb terminals,
+    pipes, and Windows consoles that cannot enable ANSI stay plain text.
+    """
+    if _color_bits() <= 0:
+        return text
+    if not _vt_windows():
+        return text
+    return _BOLD + text + _RESET
 
 
 def print_banner():
