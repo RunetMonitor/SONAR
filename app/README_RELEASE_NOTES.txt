@@ -2,6 +2,26 @@ SONAR - release notes
 
 ========
 
+1.3.6
+
+Each domain now records the volunteer resolver's DNS rcode (ok, nxdomain,
+noanswer, servfail, refused, timeout) in dns_rcode / dns_rcode_ipv6. The
+OS lookup still decides whether HTTP runs; this extra UDP query keeps the
+real DNS answer that used to show up only as "[Errno 8] nodename...".
+
+The extra DNS probe (Google, Cloudflare, NSDI, Russian ISPs, …) now asks
+AAAA as well as A. New CSV columns dns_probe_*_ipv6; the original
+dns_probe_* columns stay IPv4 so older files still join. The 300s probe
+budget is unchanged, so a slow path may finish AAAA only in part
+(dns_probe_meta partial=1). Older volunteer CSVs without these columns
+still upload.
+
+If a newer script is available, the run stops after the uppercase notice
+and asks before continuing (y to keep this old version, Enter or n to
+stop).
+
+========
+
 1.3.5
 
 Each scan writes an anonymous sonar_id (random string) into the CSV (and upload). A local
