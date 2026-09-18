@@ -61,6 +61,11 @@ The scan also queries extra DNS servers listed in app/dns_servers.txt.
 That runs in the background during the usual check. Results go into the  
 same CSV (dns_probe_* columns).
 
+Each site is tested over IPv4 and IPv6 separately (always both; there is  
+no switch). The original CSV columns stay IPv4 so older volunteer files  
+still join. IPv6 is extra `*_ipv6` columns. Missing those columns means  
+IPv6 was not measured.
+
 ========
 
 Re-send an existing CSV (no re-scan)

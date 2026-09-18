@@ -15,6 +15,7 @@ require_runtime()
 import csv
 import glob
 import hashlib
+import http.client
 import json
 import random
 import re
@@ -133,7 +134,75 @@ def _run_send_results(script_dir, csv_path, upload_token):
     finally:
         sys.argv = old_argv
 
-def _build_dns_query(domain):
+QTYPE_A = 1
+QTYPE_AAAA = 28
+
+# Unsuffixed CSV columns stay IPv4 so older volunteer files remain comparable.
+IPV6_FIELD_SUFFIX = "_ipv6"
+IPV6_CHECK_COLUMNS = (
+    "dns_resolved_ips_ipv6",
+    "dns_time_ms_ipv6",
+    "dns_error_ipv6",
+    "tcp_connect_time_ms_ipv6",
+    "ssl_valid_ipv6",
+    "ssl_issuer_ipv6",
+    "ssl_error_ipv6",
+    "http_status_ipv6",
+    "http_url_ipv6",
+    "http_redirect_url_ipv6",
+    "http_time_ms_ipv6",
+    "http_content_bytes_ipv6",
+    "http_error_ipv6",
+    "protocol_ipv6",
+    "final_domain_ipv6",
+    "http_title_ipv6",
+    "content_hash_ipv6",
+    "accessible_ipv6",
+)
+
+# IPv4 columns keep their original names so older CSVs stay joinable by header.
+RESULT_CSV_BASE_COLUMNS = (
+    "domain",
+    "check_timestamp",
+    "dns_resolved_ips",
+    "dns_time_ms",
+    "dns_error",
+    "tcp_connect_time_ms",
+    "ssl_valid",
+    "ssl_issuer",
+    "ssl_error",
+    "http_status",
+    "http_url",
+    "http_redirect_url",
+    "http_time_ms",
+    "http_content_bytes",
+    "http_error",
+    "protocol",
+    "final_domain",
+    "http_title",
+    "content_hash",
+    "source_file",
+    "accessible",
+) + IPV6_CHECK_COLUMNS + (
+    "check_location",
+    "check_provider",
+    "check_version",
+)
+
+
+def result_csv_fieldnames(include_dns_probe=True):
+    names = list(RESULT_CSV_BASE_COLUMNS)
+    if include_dns_probe and dns_probe is not None:
+        names.extend(dns_probe.COLUMNS)
+        names.extend(dns_probe.META_COLUMNS)
+    return names
+
+
+def _progress_flag(value):
+    return {"YES": "+", "PARTIAL": "~", "NO": "-", "ERROR": "!"}.get(value or "", ".")
+
+
+def _build_dns_query(domain, qtype=QTYPE_A):
     tx_id = random.randint(0, 0xFFFF)
     flags = 0x0100
     header = struct.pack(">HHHHHH", tx_id, flags, 1, 0, 0, 0)
@@ -143,7 +212,7 @@ def _build_dns_query(domain):
         raw = label.encode("ascii")
         qname += struct.pack("B", len(raw)) + raw
     qname += b"\x00"
-    qname += struct.pack(">HH", 1, 1)
+    qname += struct.pack(">HH", qtype, 1)
 
     return tx_id, header + qname
 
@@ -157,7 +226,7 @@ def _skip_name(data, offset):
         offset += 1 + b
     return offset
 
-def _parse_dns_response(data, expected_tx_id):
+def _parse_dns_response(data, expected_tx_id, qtype=QTYPE_A):
     if len(data) < 12:
         return []
     tx_id, flags, qd, an = struct.unpack(">HHHH", data[:8])
@@ -178,39 +247,171 @@ def _parse_dns_response(data, expected_tx_id):
             break
         rtype, _, _, rdlen = struct.unpack(">HHIH", data[offset : offset + 10])
         offset += 10
-        if rtype == 1 and rdlen == 4:
-            ips.append(".".join(str(b) for b in data[offset : offset + 4]))
+        rdata = data[offset : offset + rdlen]
+        if qtype == QTYPE_A and rtype == QTYPE_A and rdlen == 4:
+            ips.append(".".join(str(b) for b in rdata))
+        elif qtype == QTYPE_AAAA and rtype == QTYPE_AAAA and rdlen == 16:
+            try:
+                ips.append(socket.inet_ntop(socket.AF_INET6, rdata))
+            except (OSError, ValueError):
+                pass
         offset += rdlen
     return ips
 
-def resolve_dns_custom(domain, server, timeout):
-    tx_id, query = _build_dns_query(domain)
+def resolve_dns_custom(domain, server, timeout, qtype=QTYPE_A):
+    tx_id, query = _build_dns_query(domain, qtype=qtype)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     try:
         sock.sendto(query, (server, 53))
         data, _ = sock.recvfrom(4096)
-        return _parse_dns_response(data, tx_id)
+        return _parse_dns_response(data, tx_id, qtype=qtype)
     finally:
         sock.close()
 
-def resolve_dns_system(domain, timeout):
-    infos = socket.getaddrinfo(domain, None, socket.AF_INET, socket.SOCK_STREAM)
+def resolve_dns_system(domain, timeout, family=socket.AF_INET):
+    infos = socket.getaddrinfo(domain, None, family, socket.SOCK_STREAM)
     return list({info[4][0] for info in infos})
 
-def resolve_dns(domain, server=None, timeout=DNS_TIMEOUT):
+def resolve_dns(domain, server=None, timeout=DNS_TIMEOUT, family=socket.AF_INET):
     if server:
+        if family == socket.AF_INET6:
+            return resolve_dns_custom(
+                domain, server, timeout, qtype=QTYPE_AAAA
+            )
         return resolve_dns_custom(domain, server, timeout)
-    return resolve_dns_system(domain, timeout)
+    return resolve_dns_system(domain, timeout, family)
+
+def _host_has_ipv6():
+    return bool(getattr(socket, "has_ipv6", False))
+
+def _is_ipv6_addr(ip):
+    return ":" in (ip or "")
+
+def _ips_of_family(ips, family):
+    out = []
+    for ip in ips or []:
+        if not ip:
+            continue
+        if family == socket.AF_INET6:
+            if _is_ipv6_addr(ip):
+                out.append(ip)
+        elif not _is_ipv6_addr(ip):
+            out.append(ip)
+    return out
+
+def _tcp_connect(host, port, family, timeout, source_address=None):
+    """TCP connect using only addresses of `family` (no IPv4/IPv6 mix)."""
+    try:
+        infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise OSError(str(exc))
+    last_err = None
+    for af, socktype, proto, _canon, sockaddr in infos:
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            sock.settimeout(timeout)
+            if family == socket.AF_INET6:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                except Exception:
+                    pass
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+            return sock
+        except OSError as exc:
+            last_err = exc
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+    if last_err is not None:
+        raise last_err
+    raise OSError("getaddrinfo returned no addresses")
+
+def _family_http_connection_class(family, tls):
+    base = http.client.HTTPSConnection if tls else http.client.HTTPConnection
+
+    class FamilyConnection(base):
+        def connect(self):
+            sock = _tcp_connect(
+                self.host,
+                self.port,
+                family,
+                self.timeout,
+                getattr(self, "source_address", None),
+            )
+            if tls:
+                tunnel_host = getattr(self, "_tunnel_host", None)
+                if tunnel_host:
+                    self.sock = sock
+                    self._tunnel()
+                    sock = self.sock
+                    server_hostname = tunnel_host
+                else:
+                    server_hostname = self.host
+                sock = self._context.wrap_socket(
+                    sock, server_hostname=server_hostname
+                )
+            self.sock = sock
+
+    return FamilyConnection
+
+class _FamilyHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, family, debuglevel=0):
+        urllib.request.HTTPHandler.__init__(self, debuglevel=debuglevel)
+        self._family = family
+
+    def http_open(self, req):
+        return self.do_open(_family_http_connection_class(self._family, False), req)
+
+class _FamilyHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, family, context=None):
+        urllib.request.HTTPSHandler.__init__(self, context=context)
+        self._family = family
+
+    def https_open(self, req):
+        return self.do_open(
+            _family_http_connection_class(self._family, True),
+            req,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
 
 _ssl_ctx = ssl.create_default_context()
 _ssl_ctx.check_hostname = False
 _ssl_ctx.verify_mode = ssl.CERT_NONE
 
-def check_http(domain, timeout=HTTP_TIMEOUT):
+def _urlopen(req, timeout=None, context=None, family=socket.AF_INET):
+    if context is None:
+        context = _ssl_ctx
+    opener = urllib.request.build_opener(
+        _FamilyHTTPHandler(family),
+        _FamilyHTTPSHandler(family, context=context),
+    )
+    return opener.open(req, timeout=timeout)
+
+def _close_quietly(resp):
+    closer = getattr(resp, "close", None)
+    if closer is None:
+        return
+    try:
+        closer()
+    except Exception:
+        pass
+
+def check_http(domain, timeout=HTTP_TIMEOUT, family=socket.AF_INET):
     last_err = ""
     for scheme in ("https", "http"):
         url = "{}://{}/".format(scheme, domain)
+        resp = None
         try:
             req = urllib.request.Request(
                 url,
@@ -218,7 +419,7 @@ def check_http(domain, timeout=HTTP_TIMEOUT):
                     "User-Agent": "Mozilla/5.0 (compatible; DomainChecker/1.0)",
                 },
             )
-            resp = urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx)
+            resp = _urlopen(req, timeout=timeout, context=_ssl_ctx, family=family)
             body = resp.read(64 * 1024)
             redirect_url = resp.geturl()
             return {
@@ -244,6 +445,8 @@ def check_http(domain, timeout=HTTP_TIMEOUT):
             last_err = str(e.reason)
         except Exception as e:
             last_err = str(e)
+        finally:
+            _close_quietly(resp)
     return {
         "status": 0,
         "size": 0,
@@ -254,19 +457,14 @@ def check_http(domain, timeout=HTTP_TIMEOUT):
         "protocol": "",
     }
 
-def check_ssl(domain, timeout=HTTP_TIMEOUT):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
+def check_ssl(domain, timeout=HTTP_TIMEOUT, family=socket.AF_INET):
+    sock = None
     t0 = time.monotonic()
     try:
-        sock.connect((domain, 443))
+        sock = _tcp_connect(domain, 443, family, timeout)
         tcp_ms = (time.monotonic() - t0) * 1000
     except Exception as e:
         tcp_ms = (time.monotonic() - t0) * 1000
-        try:
-            sock.close()
-        except Exception:
-            pass
         return tcp_ms, False, "", "tcp: " + str(e).replace("\n", " ")
 
     ctx = ssl.create_default_context()
@@ -283,7 +481,8 @@ def check_ssl(domain, timeout=HTTP_TIMEOUT):
         return tcp_ms, False, "", str(e).replace("\n", " ")
     finally:
         try:
-            sock.close()
+            if sock is not None:
+                sock.close()
         except Exception:
             pass
 
@@ -436,6 +635,100 @@ def _print_version_block(local, remote):
     _print_update_notice(local, remote)
 
 
+def _col(name, suffix):
+    return name + suffix
+
+
+def _http_accessible(result):
+    status = result.get("status") or 0
+    size = result.get("size") or 0
+    if 200 <= status < 400 and size > 0:
+        return "YES"
+    if 200 <= status < 400:
+        return "PARTIAL"
+    return "NO"
+
+
+def _apply_http_result(row, result, http_ms, suffix, domain):
+    row[_col("http_status", suffix)] = (
+        str(result["status"]) if result["status"] else ""
+    )
+    row[_col("http_url", suffix)] = result["url"]
+    row[_col("http_redirect_url", suffix)] = (
+        result["redirect_url"] if result["redirect_url"] != result["url"] else ""
+    )
+    row[_col("http_time_ms", suffix)] = "{:.1f}".format(http_ms)
+    row[_col("http_content_bytes", suffix)] = (
+        str(result["size"]) if result["size"] else ""
+    )
+    row[_col("http_error", suffix)] = (
+        result["error"].replace("\n", " ") if result["error"] else ""
+    )
+    row[_col("protocol", suffix)] = result["protocol"]
+    if result["redirect_url"]:
+        try:
+            redir_host = urlparse(result["redirect_url"]).hostname
+            if redir_host and redir_host != domain:
+                row[_col("final_domain", suffix)] = redir_host
+        except Exception:
+            pass
+    row[_col("http_title", suffix)] = _extract_title(result["body"])
+    row[_col("content_hash", suffix)] = _content_hash(result["body"])
+    row[_col("accessible", suffix)] = _http_accessible(result)
+
+
+def _resolve_family(domain, server, family):
+    t0 = time.monotonic()
+    try:
+        ips = _ips_of_family(resolve_dns(domain, server, family=family), family)
+        dns_ms = (time.monotonic() - t0) * 1000
+        return ips, "{:.1f}".format(dns_ms), ""
+    except Exception as exc:
+        dns_ms = (time.monotonic() - t0) * 1000
+        return [], "{:.1f}".format(dns_ms), str(exc).replace("\n", " ")
+
+
+def _probe_family(row, domain, family, suffix, ips):
+    """Fill one IP-family's DNS/SSL/HTTP columns. suffix='' is IPv4 (legacy names)."""
+    if not ips:
+        if family == socket.AF_INET6:
+            dns_err = "no AAAA records returned"
+            http_err = "skipped (no AAAA records)"
+        else:
+            dns_err = "no A records returned"
+            http_err = "skipped (no A records)"
+        row[_col("dns_error", suffix)] = dns_err
+        row[_col("http_error", suffix)] = http_err
+        if suffix == "":
+            row["accessible"] = "NO"
+        return
+
+    row[_col("dns_resolved_ips", suffix)] = "; ".join(ips)
+    try:
+        tcp_ms, ssl_ok, ssl_issuer, ssl_err = check_ssl(domain, family=family)
+        row[_col("tcp_connect_time_ms", suffix)] = "{:.1f}".format(tcp_ms)
+        row[_col("ssl_valid", suffix)] = "YES" if ssl_ok else "NO"
+        row[_col("ssl_issuer", suffix)] = ssl_issuer
+        row[_col("ssl_error", suffix)] = ssl_err
+    except Exception as exc:
+        row[_col("ssl_valid", suffix)] = "NO"
+        row[_col("ssl_error", suffix)] = str(exc).replace("\n", " ")
+
+    t0 = time.monotonic()
+    try:
+        result = check_http(domain, family=family)
+        http_ms = (time.monotonic() - t0) * 1000
+        _apply_http_result(row, result, http_ms, suffix, domain)
+    except Exception as exc:
+        http_ms = (time.monotonic() - t0) * 1000
+        row[_col("http_time_ms", suffix)] = "{:.1f}".format(http_ms)
+        row[_col("http_error", suffix)] = str(exc).replace("\n", " ")
+        if suffix == "":
+            row["accessible"] = "NO"
+        else:
+            row["accessible_ipv6"] = "NO"
+
+
 def check_domain(domain, source_file, server=None, original=None):
     row = {
         "domain": original if original is not None else domain,
@@ -460,70 +753,32 @@ def check_domain(domain, source_file, server=None, original=None):
         "content_hash": "",
         "accessible": "NO",
     }
+    for name in IPV6_CHECK_COLUMNS:
+        row[name] = ""
 
-    t0 = time.monotonic()
-    try:
-        ips = resolve_dns(domain, server)
-        dns_ms = (time.monotonic() - t0) * 1000
-        row["dns_resolved_ips"] = "; ".join(ips)
-        row["dns_time_ms"] = "{:.1f}".format(dns_ms)
-    except Exception as e:
-        dns_ms = (time.monotonic() - t0) * 1000
-        row["dns_time_ms"] = "{:.1f}".format(dns_ms)
-        row["dns_error"] = str(e).replace("\n", " ")
+    ips_v4, dns_ms_v4, dns_err_v4 = _resolve_family(domain, server, socket.AF_INET)
+    row["dns_time_ms"] = dns_ms_v4
+    if dns_err_v4:
+        row["dns_error"] = dns_err_v4
         row["http_error"] = "skipped (DNS failed)"
+        row["accessible"] = "NO"
+    else:
+        _probe_family(row, domain, socket.AF_INET, "", ips_v4)
+
+    if not _host_has_ipv6():
+        row["dns_error_ipv6"] = "host has no IPv6"
+        row["http_error_ipv6"] = "skipped (no IPv6)"
         return row
 
-    if not ips:
-        row["dns_error"] = "no A records returned"
-        row["http_error"] = "skipped (no A records)"
+    ips_v6, dns_ms_v6, dns_err_v6 = _resolve_family(
+        domain, server, socket.AF_INET6
+    )
+    row["dns_time_ms_ipv6"] = dns_ms_v6
+    if dns_err_v6:
+        row["dns_error_ipv6"] = dns_err_v6
+        row["http_error_ipv6"] = "skipped (DNS failed)"
         return row
-
-    try:
-        tcp_ms, ssl_ok, ssl_issuer, ssl_err = check_ssl(domain)
-        row["tcp_connect_time_ms"] = "{:.1f}".format(tcp_ms)
-        row["ssl_valid"] = "YES" if ssl_ok else "NO"
-        row["ssl_issuer"] = ssl_issuer
-        row["ssl_error"] = ssl_err
-    except Exception as e:
-        row["ssl_valid"] = "NO"
-        row["ssl_error"] = str(e).replace("\n", " ")
-
-    t0 = time.monotonic()
-    try:
-        r = check_http(domain)
-        http_ms = (time.monotonic() - t0) * 1000
-        row["http_status"] = str(r["status"]) if r["status"] else ""
-        row["http_url"] = r["url"]
-        row["http_redirect_url"] = (
-            r["redirect_url"] if r["redirect_url"] != r["url"] else ""
-        )
-        row["http_time_ms"] = "{:.1f}".format(http_ms)
-        row["http_content_bytes"] = str(r["size"]) if r["size"] else ""
-        row["http_error"] = r["error"].replace("\n", " ") if r["error"] else ""
-        row["protocol"] = r["protocol"]
-
-        if r["redirect_url"]:
-            try:
-                redir_host = urlparse(r["redirect_url"]).hostname
-                if redir_host and redir_host != domain:
-                    row["final_domain"] = redir_host
-            except Exception:
-                pass
-
-        row["http_title"] = _extract_title(r["body"])
-        row["content_hash"] = _content_hash(r["body"])
-
-        status = r["status"]
-        if 200 <= status < 400 and r["size"] > 0:
-            row["accessible"] = "YES"
-        elif 200 <= status < 400:
-            row["accessible"] = "PARTIAL"
-    except Exception as e:
-        http_ms = (time.monotonic() - t0) * 1000
-        row["http_time_ms"] = "{:.1f}".format(http_ms)
-        row["http_error"] = str(e).replace("\n", " ")
-
+    _probe_family(row, domain, socket.AF_INET6, IPV6_FIELD_SUFFIX, ips_v6)
     return row
 
 _TRANSLIT_MAP = {
@@ -1026,6 +1281,10 @@ def main():
             )
         )
     print("  Workers    : {}".format(MAX_WORKERS))
+    if _host_has_ipv6():
+        print("  IP versions: IPv4 and IPv6 (each tested separately)")
+    else:
+        print("  IP versions: IPv4 (this computer has no IPv6)")
     print("  Output     : {}/{}".format(RESULTS_DIR, OUTPUT_CSV))
     print()
 
@@ -1060,35 +1319,8 @@ def main():
         )
 
     # No check_ip_address column - end-user public IP is not persisted.
-    fieldnames = [
-        "domain",
-        "check_timestamp",
-        "dns_resolved_ips",
-        "dns_time_ms",
-        "dns_error",
-        "tcp_connect_time_ms",
-        "ssl_valid",
-        "ssl_issuer",
-        "ssl_error",
-        "http_status",
-        "http_url",
-        "http_redirect_url",
-        "http_time_ms",
-        "http_content_bytes",
-        "http_error",
-        "protocol",
-        "final_domain",
-        "http_title",
-        "content_hash",
-        "source_file",
-        "accessible",
-        "check_location",
-        "check_provider",
-        "check_version",
-    ]
-    if dns_probe is not None:
-        fieldnames.extend(dns_probe.COLUMNS)
-        fieldnames.extend(dns_probe.META_COLUMNS)
+    # Unsuffixed columns stay IPv4; *_ipv6 are additive so older CSVs still join.
+    fieldnames = result_csv_fieldnames()
 
     results = []
     done = 0
@@ -1107,14 +1339,14 @@ def main():
                 row = f.result()
                 row["probe_key"] = (ascii_domain or "").strip().rstrip(".").lower()
                 results.append(row)
-                flag = {"YES": "+", "PARTIAL": "~", "NO": "-"}.get(
-                    row["accessible"], "!"
-                )
+                flag = _progress_flag(row["accessible"])
+                flag6 = _progress_flag(row.get("accessible_ipv6"))
                 print(
-                    "  [{:>4}/{}] {} {:<40s}  dns={:>7s}ms  http={:>8s}ms  [{}]".format(
+                    "  [{:>4}/{}] {}{} {:<40s}  dns={:>7s}ms  http={:>8s}ms  [{}]".format(
                         done,
                         total,
                         flag,
+                        flag6,
                         original,
                         row["dns_time_ms"] or "-",
                         row["http_time_ms"] or "-",
@@ -1163,6 +1395,14 @@ def main():
     part = sum(1 for r in results if r["accessible"] == "PARTIAL")
     no = sum(1 for r in results if r["accessible"] == "NO")
     errs = sum(1 for r in results if r["accessible"] == "ERROR")
+    yes6 = sum(1 for r in results if r.get("accessible_ipv6") == "YES")
+    part6 = sum(1 for r in results if r.get("accessible_ipv6") == "PARTIAL")
+    no6 = sum(1 for r in results if r.get("accessible_ipv6") == "NO")
+    measured6 = sum(
+        1
+        for r in results
+        if r.get("accessible_ipv6") in ("YES", "PARTIAL", "NO", "ERROR")
+    )
 
     print()
     print("=" * 55)
@@ -1172,6 +1412,11 @@ def main():
     print("  Blocked/Down : {}".format(no))
     print("  Errors       : {}".format(errs))
     print("  Total        : {}".format(total))
+    print(
+        "  IPv6         : {} accessible, {} partial, {} blocked, {} not measured".format(
+            yes6, part6, no6, max(0, total - measured6)
+        )
+    )
     _print_dns_probe_summary(probe_result)
     print()
     print("  CSV saved to: {}".format(out_path))

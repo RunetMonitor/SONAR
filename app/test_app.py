@@ -11,7 +11,9 @@ import socket
 import ssl
 import struct
 import sys
+import threading
 import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -337,6 +339,12 @@ class TestDnsHelpers:
         assert query[0:2] == struct.pack(">H", tx_id)
         assert b"example" in query
         assert b"com" in query
+        assert query[-4:] == struct.pack(">HH", 1, 1)
+
+    def test_build_dns_query_aaaa(self):
+        tx_id, query = run._build_dns_query("example.com", qtype=run.QTYPE_AAAA)
+        assert 0 <= tx_id <= 0xFFFF
+        assert query[-4:] == struct.pack(">HH", 28, 1)
 
     def test_parse_dns_response_empty_or_bad(self):
         assert run._parse_dns_response(b"", 1) == []
@@ -356,6 +364,45 @@ class TestDnsHelpers:
         )
         ips = run._parse_dns_response(header + question + answer, tx_id)
         assert ips == ["1.2.3.4"]
+
+    def test_parse_dns_response_with_aaaa_record(self):
+        tx_id = 0x1234
+        header = struct.pack(">HHHHHH", tx_id, 0x8180, 1, 1, 0, 0)
+        qname = b"\x07example\x03com\x00"
+        question = qname + struct.pack(">HH", 28, 1)
+        rdata = socket.inet_pton(socket.AF_INET6, "2001:db8::1")
+        answer = b"\xc0\x0c" + struct.pack(">HHIH", 28, 1, 60, 16) + rdata
+        ips = run._parse_dns_response(
+            header + question + answer, tx_id, qtype=run.QTYPE_AAAA
+        )
+        assert ips == ["2001:db8::1"]
+
+    def test_parse_dns_response_aaaa_ignores_a_records(self):
+        tx_id = 0x1234
+        header = struct.pack(">HHHHHH", tx_id, 0x8180, 1, 1, 0, 0)
+        qname = b"\x07example\x03com\x00"
+        question = qname + struct.pack(">HH", 28, 1)
+        answer = (
+            b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + bytes([1, 2, 3, 4])
+        )
+        ips = run._parse_dns_response(
+            header + question + answer, tx_id, qtype=run.QTYPE_AAAA
+        )
+        assert ips == []
+
+    def test_parse_aaaa_inet_ntop_error_is_skipped(self, monkeypatch):
+        monkeypatch.setattr(
+            run.socket, "inet_ntop", mock.Mock(side_effect=OSError("bad"))
+        )
+        tx_id = 0x1234
+        header = struct.pack(">HHHHHH", tx_id, 0x8180, 1, 1, 0, 0)
+        qname = b"\x07example\x03com\x00"
+        question = qname + struct.pack(">HH", 28, 1)
+        answer = b"\xc0\x0c" + struct.pack(">HHIH", 28, 1, 60, 16) + (b"\x00" * 16)
+        ips = run._parse_dns_response(
+            header + question + answer, tx_id, qtype=run.QTYPE_AAAA
+        )
+        assert ips == []
 
     def test_skip_name_pointer_and_labels(self):
         data = b"\x03abc\x00" + b"\xc0\x00"
@@ -583,6 +630,21 @@ class TestResolveDns:
         )
         assert set(run.resolve_dns("example.com")) == {"9.9.9.9", "8.8.8.8"}
 
+    def test_system_path_ipv6(self, monkeypatch):
+        seen = []
+
+        def fake_gai(host, port, family, socktype):
+            seen.append(family)
+            return [
+                (socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("2001:db8::1", 0, 0, 0)),
+            ]
+
+        monkeypatch.setattr(run.socket, "getaddrinfo", fake_gai)
+        assert run.resolve_dns("example.com", family=socket.AF_INET6) == [
+            "2001:db8::1"
+        ]
+        assert seen == [socket.AF_INET6]
+
     def test_custom_path(self, monkeypatch):
         called = {}
 
@@ -594,8 +656,225 @@ class TestResolveDns:
         assert run.resolve_dns("example.com", server="8.8.8.8") == ["1.1.1.1"]
         assert called["args"][1] == "8.8.8.8"
 
+    def test_custom_path_ipv6_queries_aaaa(self, monkeypatch):
+        called = {}
 
-class TestCheckHttp:
+        def fake_custom(domain, server, timeout, qtype=1):
+            called["qtype"] = qtype
+            return ["2001:db8::1"]
+
+        monkeypatch.setattr(run, "resolve_dns_custom", fake_custom)
+        assert run.resolve_dns(
+            "example.com", server="8.8.8.8", family=socket.AF_INET6
+        ) == ["2001:db8::1"]
+        assert called["qtype"] == run.QTYPE_AAAA
+
+
+class TestIpFamilyHelpers:
+    def test_ips_of_family(self):
+        mixed = ["1.2.3.4", "2001:db8::1", "8.8.8.8"]
+        assert run._ips_of_family(mixed, socket.AF_INET) == ["1.2.3.4", "8.8.8.8"]
+        assert run._ips_of_family(mixed, socket.AF_INET6) == ["2001:db8::1"]
+        assert run._ips_of_family(["", "1.2.3.4"], socket.AF_INET) == ["1.2.3.4"]
+        assert run._ips_of_family(["", "2001:db8::1"], socket.AF_INET6) == [
+            "2001:db8::1"
+        ]
+
+    def test_progress_flag(self):
+        assert run._progress_flag("YES") == "+"
+        assert run._progress_flag("PARTIAL") == "~"
+        assert run._progress_flag("NO") == "-"
+        assert run._progress_flag("") == "."
+        assert run._progress_flag(None) == "."
+
+    def test_http_accessible(self):
+        assert run._http_accessible({"status": 200, "size": 10}) == "YES"
+        assert run._http_accessible({"status": 301, "size": 0}) == "PARTIAL"
+        assert run._http_accessible({"status": 403, "size": 12}) == "NO"
+        assert run._http_accessible({"status": 0, "size": 0}) == "NO"
+
+    def test_tcp_connect_empty_getaddrinfo(self, monkeypatch):
+        monkeypatch.setattr(run.socket, "getaddrinfo", lambda *a, **k: [])
+        with pytest.raises(OSError):
+            run._tcp_connect("example.com", 443, socket.AF_INET, 1)
+
+    def test_tcp_connect_gaierror(self, monkeypatch):
+        def boom(*a, **k):
+            raise socket.gaierror(8, "nodename")
+
+        monkeypatch.setattr(run.socket, "getaddrinfo", boom)
+        with pytest.raises(OSError):
+            run._tcp_connect("example.com", 443, socket.AF_INET6, 1)
+
+    def test_tcp_connect_ipv6_setsockopt_failure_and_bind(self, monkeypatch):
+        calls = []
+
+        class FakeSock:
+            def settimeout(self, t):
+                pass
+
+            def setsockopt(self, *a):
+                calls.append("setsockopt")
+                raise OSError("no")
+
+            def bind(self, addr):
+                calls.append(("bind", addr))
+
+            def connect(self, addr):
+                calls.append(("connect", addr))
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            run.socket,
+            "getaddrinfo",
+            lambda *a, **k: [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("2001:db8::1", 443, 0, 0),
+                )
+            ],
+        )
+        monkeypatch.setattr(run.socket, "socket", lambda *a, **k: FakeSock())
+        sock = run._tcp_connect(
+            "example.com", 443, socket.AF_INET6, 1, source_address=("::", 0)
+        )
+        assert ("bind", ("::", 0)) in calls
+        assert any(c[0] == "connect" for c in calls if isinstance(c, tuple))
+        assert sock is not None
+
+    def test_close_quietly_swallows_errors(self):
+        class Boom:
+            def close(self):
+                raise OSError("nope")
+
+        run._close_quietly(Boom())
+        run._close_quietly(object())
+
+    def test_urlopen_default_context(self, monkeypatch):
+        seen = {}
+
+        class FakeOpener:
+            def open(self, req, timeout=None):
+                seen["timeout"] = timeout
+                class Resp:
+                    def getcode(self):
+                        return 200
+
+                    def geturl(self):
+                        return "https://example.com/"
+
+                    def read(self, n=-1):
+                        return b"x"
+
+                    def close(self):
+                        pass
+
+                return Resp()
+
+        monkeypatch.setattr(
+            run.urllib.request, "build_opener", lambda *a, **k: FakeOpener()
+        )
+        resp = run._urlopen(
+            urllib.request.Request("https://example.com/"), timeout=1, context=None
+        )
+        assert seen["timeout"] == 1
+        assert resp.getcode() == 200
+
+    def test_https_family_connection_wraps_tls(self, monkeypatch):
+        class FakeSock:
+            pass
+
+        monkeypatch.setattr(run, "_tcp_connect", lambda *a, **k: FakeSock())
+        wrapped = []
+
+        class FakeCtx:
+            check_hostname = False
+            verify_mode = ssl.CERT_NONE
+
+            def wrap_socket(self, sock, server_hostname=None):
+                wrapped.append(server_hostname)
+                return sock
+
+        Conn = run._family_http_connection_class(socket.AF_INET, True)
+        conn = Conn("example.com", timeout=1, context=FakeCtx())
+        conn.connect()
+        assert wrapped == ["example.com"]
+        assert conn.sock is not None
+
+    def test_https_family_connection_tunnels_then_wraps_sni(self):
+        """HTTPS through HTTP CONNECT: SNI is the origin, TCP is the proxy."""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        srv.settimeout(3)
+        port = srv.getsockname()[1]
+        seen = {"req": b"", "err": None}
+
+        def serve():
+            conn = None
+            try:
+                conn, _addr = srv.accept()
+                conn.settimeout(3)
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                seen["req"] = buf
+                conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                try:
+                    conn.recv(1)
+                except Exception:
+                    pass
+            except Exception as exc:
+                seen["err"] = exc
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        thread = threading.Thread(target=serve)
+        thread.daemon = True
+        thread.start()
+
+        wrapped = []
+
+        class FakeCtx:
+            check_hostname = False
+            verify_mode = ssl.CERT_NONE
+
+            def wrap_socket(self, sock, server_hostname=None):
+                wrapped.append(server_hostname)
+                return sock
+
+        Conn = run._family_http_connection_class(socket.AF_INET, True)
+        conn = Conn("127.0.0.1", port, timeout=3, context=FakeCtx())
+        conn.set_tunnel("origin.example", 443)
+        try:
+            conn.connect()
+            assert wrapped == ["origin.example"]
+            assert b"CONNECT origin.example:443" in seen["req"]
+            assert conn.sock is not None
+            assert seen["err"] is None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                srv.close()
+            except Exception:
+                pass
+            thread.join(3)
     def test_https_success(self, monkeypatch):
         class FakeResp:
             def getcode(self):
@@ -607,9 +886,10 @@ class TestCheckHttp:
             def read(self, n=-1):
                 return b"<html><title>Ex</title></html>"
 
-        monkeypatch.setattr(
-            run.urllib.request, "urlopen", lambda *a, **k: FakeResp()
-        )
+            def close(self):
+                pass
+
+        monkeypatch.setattr(run, "_urlopen", lambda *a, **k: FakeResp())
         r = run.check_http("example.com", timeout=1)
         assert r["status"] == 200
         assert r["protocol"] == "https"
@@ -622,7 +902,7 @@ class TestCheckHttp:
                 "https://example.com/", 503, "Unavailable", hdrs=None, fp=None
             )
 
-        monkeypatch.setattr(run.urllib.request, "urlopen", boom)
+        monkeypatch.setattr(run, "_urlopen", boom)
         r = run.check_http("example.com", timeout=1)
         assert r["status"] == 503
         assert r["protocol"] == "https"
@@ -631,11 +911,24 @@ class TestCheckHttp:
         def boom(*a, **k):
             raise urllib.error.URLError("down")
 
-        monkeypatch.setattr(run.urllib.request, "urlopen", boom)
+        monkeypatch.setattr(run, "_urlopen", boom)
         r = run.check_http("example.com", timeout=1)
         assert r["status"] == 0
         assert r["protocol"] == ""
         assert "down" in r["error"]
+
+    def test_http_uses_requested_family(self, monkeypatch):
+        seen = []
+
+        def fake_tcp(host, port, family, timeout, source_address=None):
+            seen.append(family)
+            raise OSError("stop")
+
+        monkeypatch.setattr(run, "_tcp_connect", fake_tcp)
+        r = run.check_http("example.com", timeout=1, family=socket.AF_INET6)
+        assert socket.AF_INET6 in seen
+        assert r["status"] == 0
+        assert "stop" in r["error"]
 
 
 class TestCheckDomain:
@@ -705,7 +998,127 @@ class TestCheckDomain:
         assert row["accessible"] == "PARTIAL"
 
 
-class TestDetectLocation:
+def _http_result(status=200, size=100, error="", protocol="https", redirect=None, body=b"<title>Hi</title>"):
+    url = "https://example.com/"
+    return {
+        "status": status,
+        "size": size,
+        "url": url,
+        "redirect_url": redirect if redirect is not None else url,
+        "error": error,
+        "body": body,
+        "protocol": protocol,
+    }
+
+
+class TestCheckDomainIpFamilies:
+    def test_ipv4_blocked_ipv6_open(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: True)
+
+        def fake_resolve(domain, server=None, timeout=None, family=socket.AF_INET):
+            if family == socket.AF_INET6:
+                return ["2001:db8::1"]
+            return ["1.2.3.4"]
+
+        monkeypatch.setattr(run, "resolve_dns", fake_resolve)
+        monkeypatch.setattr(
+            run, "check_ssl", mock.Mock(return_value=(1.0, True, "Issuer", ""))
+        )
+
+        def fake_http(domain, timeout=None, family=socket.AF_INET):
+            if family == socket.AF_INET6:
+                return _http_result(status=200, size=50, body=b"ok")
+            return _http_result(status=0, size=0, error="blocked", protocol="")
+
+        monkeypatch.setattr(run, "check_http", fake_http)
+        row = run.check_domain("example.com", "list_x.txt")
+        assert row["accessible"] == "NO"
+        assert row["accessible_ipv6"] == "YES"
+        assert row["dns_resolved_ips"] == "1.2.3.4"
+        assert row["dns_resolved_ips_ipv6"] == "2001:db8::1"
+        assert row["http_error"] == "blocked"
+
+    def test_ipv6_skipped_when_host_has_none(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: False)
+        resolve = mock.Mock(return_value=["1.2.3.4"])
+        monkeypatch.setattr(run, "resolve_dns", resolve)
+        monkeypatch.setattr(
+            run, "check_ssl", mock.Mock(return_value=(1.0, True, "I", ""))
+        )
+        monkeypatch.setattr(run, "check_http", mock.Mock(return_value=_http_result()))
+        row = run.check_domain("example.com", "list_x.txt")
+        assert row["accessible"] == "YES"
+        assert row["accessible_ipv6"] == ""
+        assert "no IPv6" in row["dns_error_ipv6"]
+        assert "skipped" in row["http_error_ipv6"]
+        assert resolve.call_count == 1
+
+    def test_ipv6_skipped_without_aaaa(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: True)
+
+        def fake_resolve(domain, server=None, timeout=None, family=socket.AF_INET):
+            if family == socket.AF_INET6:
+                return []
+            return ["1.2.3.4"]
+
+        monkeypatch.setattr(run, "resolve_dns", fake_resolve)
+        monkeypatch.setattr(
+            run, "check_ssl", mock.Mock(return_value=(1.0, True, "I", ""))
+        )
+        http = mock.Mock(return_value=_http_result())
+        monkeypatch.setattr(run, "check_http", http)
+        row = run.check_domain("example.com", "list_x.txt")
+        assert row["accessible"] == "YES"
+        assert row["accessible_ipv6"] == ""
+        assert "no AAAA" in row["dns_error_ipv6"]
+        assert http.call_count == 1
+
+    def test_ipv4_dns_fail_still_probes_ipv6(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: True)
+
+        def fake_resolve(domain, server=None, timeout=None, family=socket.AF_INET):
+            if family == socket.AF_INET6:
+                return ["2001:db8::1"]
+            raise OSError("fail")
+
+        monkeypatch.setattr(run, "resolve_dns", fake_resolve)
+        monkeypatch.setattr(
+            run, "check_ssl", mock.Mock(return_value=(1.0, True, "I", ""))
+        )
+        monkeypatch.setattr(
+            run,
+            "check_http",
+            mock.Mock(return_value=_http_result(status=200, size=10, body=b"ok")),
+        )
+        row = run.check_domain("example.com", "list_x.txt")
+        assert row["accessible"] == "NO"
+        assert "fail" in row["dns_error"]
+        assert "skipped" in row["http_error"]
+        assert row["accessible_ipv6"] == "YES"
+
+    def test_ipv6_http_exception_is_measured_no(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: True)
+
+        def fake_resolve(domain, server=None, timeout=None, family=socket.AF_INET):
+            if family == socket.AF_INET6:
+                return ["2001:db8::1"]
+            return ["1.2.3.4"]
+
+        monkeypatch.setattr(run, "resolve_dns", fake_resolve)
+        monkeypatch.setattr(
+            run, "check_ssl", mock.Mock(return_value=(1.0, True, "I", ""))
+        )
+
+        def fake_http(domain, timeout=None, family=socket.AF_INET):
+            if family == socket.AF_INET6:
+                raise RuntimeError("v6 boom")
+            return _http_result()
+
+        monkeypatch.setattr(run, "check_http", fake_http)
+        row = run.check_domain("example.com", "list_x.txt")
+        assert row["accessible"] == "YES"
+        assert row["accessible_ipv6"] == "NO"
+        assert "v6 boom" in row["http_error_ipv6"]
     def test_success_no_ip_in_location(self, monkeypatch):
         payload = {
             "city": "Москва",
@@ -1301,16 +1714,11 @@ class TestSendResultsMain:
 class TestCsvNoIpPersistence:
     def test_csv_fieldnames_exclude_ip(self, tmp_path, monkeypatch):
         """Simulate the CSV write path fieldnames used by run.main."""
-        # Field list is constructed inside main; assert the contract via a mini write
-        # matching run.py's hardened columns.
-        fieldnames = [
-            "domain",
-            "accessible",
-            "check_location",
-            "check_provider",
-            "check_version",
-        ]
+        fieldnames = run.result_csv_fieldnames(include_dns_probe=False)
         assert "check_ip_address" not in fieldnames
+        assert "accessible" in fieldnames
+        assert "accessible_ipv6" in fieldnames
+        assert fieldnames.index("accessible") < fieldnames.index("accessible_ipv6")
         path = tmp_path / "out.csv"
         with open(path, "w", newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=fieldnames)
@@ -1319,6 +1727,7 @@ class TestCsvNoIpPersistence:
                 {
                     "domain": "example.com",
                     "accessible": "YES",
+                    "accessible_ipv6": "NO",
                     "check_location": "City, Country",
                     "check_provider": "ISP",
                     "check_version": "1.0",
@@ -1327,6 +1736,7 @@ class TestCsvNoIpPersistence:
         text = path.read_text(encoding="utf-8")
         assert "check_ip_address" not in text
         assert "1.1.1.1" not in text
+        assert "accessible_ipv6" in text
 
 
 class TestReadmeVolunteerWording:
@@ -1344,6 +1754,8 @@ class TestReadmeVolunteerWording:
         )
         assert "Python 3.7 or newer" in readme
         assert "3.6" not in readme
+        assert "IPv4" in readme
+        assert "IPv6" in readme
 
 
 class TestLaunchersPythonRequirement:
@@ -1739,22 +2151,35 @@ class TestDnsParseEdgeCases:
                 pass
 
         monkeypatch.setattr(run.socket, "socket", lambda *a, **k: FakeSock())
-        monkeypatch.setattr(run, "_build_dns_query", lambda domain: (tx_id, b"query"))
+        monkeypatch.setattr(
+            run, "_build_dns_query", lambda domain, qtype=1: (tx_id, b"query")
+        )
         assert run.resolve_dns_custom("example.com", "8.8.8.8", 1) == ["9.9.9.9"]
 
 
 class TestCheckHttpSslExtra:
     def test_generic_exception_then_fail(self, monkeypatch):
         monkeypatch.setattr(
-            run.urllib.request,
-            "urlopen",
+            run,
+            "_urlopen",
             mock.Mock(side_effect=RuntimeError("boom")),
         )
         r = run.check_http("example.com", timeout=1)
         assert r["status"] == 0
         assert "boom" in r["error"]
 
+    def _patch_v4_gai(self, monkeypatch):
+        monkeypatch.setattr(
+            run.socket,
+            "getaddrinfo",
+            lambda *a, **k: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+            ],
+        )
+
     def test_check_ssl_tcp_fail(self, monkeypatch):
+        self._patch_v4_gai(monkeypatch)
+
         class FakeSock:
             def settimeout(self, t):
                 pass
@@ -1772,6 +2197,8 @@ class TestCheckHttpSslExtra:
         assert tcp_ms >= 0
 
     def test_check_ssl_handshake_ok(self, monkeypatch):
+        self._patch_v4_gai(monkeypatch)
+
         class FakeSslSock:
             def getpeercert(self):
                 return {
@@ -1809,6 +2236,8 @@ class TestCheckHttpSslExtra:
         assert err == ""
 
     def test_check_ssl_handshake_fail(self, monkeypatch):
+        self._patch_v4_gai(monkeypatch)
+
         class FakeCtx:
             def wrap_socket(self, sock, server_hostname=None):
                 raise run.ssl.SSLError("bad cert")
@@ -2194,6 +2623,7 @@ class TestRunMainFlows:
         monkeypatch.setattr(
             run, "detect_location", lambda: ("City, Country", "ISP", "1.1.1.1")
         )
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: False)
         self._stub_check_domain(monkeypatch)
         monkeypatch.setattr(run, "_read_version_text", lambda *_a: "9.9.9")
         run.main()
@@ -2205,6 +2635,8 @@ class TestRunMainFlows:
         text = out_csv.read_text(encoding="utf-8")
         assert "check_ip_address" not in text
         assert "City, Country" in text
+        assert "accessible_ipv6" in text.splitlines()[0]
+        assert "this computer has no IPv6" in out
 
     def test_update_notice_at_start_and_end(self, tmp_path, monkeypatch, capsys):
         lists = tmp_path / "app" / "url_check_lists"
@@ -3376,6 +3808,7 @@ class TestRunDnsProbeEndToEnd:
 
         for column in dns_probe.COLUMNS + dns_probe.META_COLUMNS:
             assert column in fieldnames
+        assert "accessible_ipv6" in fieldnames
         assert "probe_key" not in fieldnames
 
         row = rows[0]
@@ -3416,6 +3849,7 @@ class TestRunDnsProbeEndToEnd:
         run.main()
         fieldnames, rows = self._read(csv_path)
         assert not any(name.startswith("dns_probe") for name in fieldnames)
+        assert "accessible_ipv6" in fieldnames
         assert rows[0]["accessible"] == "YES"
         assert rows[0]["check_version"] == "1.3.0"
 
@@ -3547,6 +3981,37 @@ class TestProbeUploadCompatibility:
         ):
             assert old_entry["source_file"] == new_entry["source_file"]
             assert old_entry["status"] == new_entry["status"]
+
+    def test_old_csv_has_no_ipv6_block(self, monkeypatch):
+        monkeypatch.setattr(sr, "get_dns_servers", lambda: [])
+        payload = sr._build_payload(self._old_rows(), Path("check_results_old.csv"))
+        assert "ipv6" not in payload["result_data"]
+        assert "accessible_ipv6" not in payload["result_data"]["domains"][0]
+        assert payload["accessible"] == 1
+
+    def test_ipv6_columns_travel_without_changing_legacy_totals(self, monkeypatch):
+        monkeypatch.setattr(sr, "get_dns_servers", lambda: [])
+        rows = self._old_rows()
+        rows[0]["accessible_ipv6"] = "YES"
+        rows[0]["http_status_ipv6"] = "200"
+        rows[1]["accessible_ipv6"] = "NO"
+        payload = sr._build_payload(rows, Path("check_results_v6.csv"))
+        assert payload["accessible"] == 1
+        assert payload["blocked_down"] == 1
+        assert "ipv6" not in payload
+        ipv6 = payload["result_data"]["ipv6"]
+        assert ipv6["accessible"] == 1
+        assert ipv6["blocked_down"] == 1
+        assert ipv6["measured"] == 2
+        assert payload["result_data"]["domains"][0]["accessible_ipv6"] == "YES"
+        assert payload["result_data"]["domains"][0]["status"] == "accessible"
+
+    def test_empty_ipv6_verdicts_are_not_measured(self, monkeypatch):
+        monkeypatch.setattr(sr, "get_dns_servers", lambda: [])
+        rows = self._old_rows()
+        rows[0]["accessible_ipv6"] = ""
+        payload = sr._build_payload(rows, Path("c.csv"))
+        assert "ipv6" not in payload["result_data"]
 
     def test_probe_summary_without_the_module(self, monkeypatch):
         monkeypatch.setattr(sr, "dns_probe", None)

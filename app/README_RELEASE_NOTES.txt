@@ -2,6 +2,12 @@ SONAR - release notes
 
 ========
 
+1.3.4
+
+Each site is now checked over IPv4 and IPv6 separately.
+
+========
+
 1.3.3
 
 Send could crash after a finished scan if Python was older than 3.11.
