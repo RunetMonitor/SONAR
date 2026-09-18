@@ -9,7 +9,10 @@ License: MIT (see LICENSE)
 https://github.com/RunetMonitor/SONAR
 
 Required:  
-Python 3.6 or newer
+Python 3.7 or newer  
+
+The script checks this when it starts. If Python is too old, or a required  
+standard module is missing, it stops with an error before the scan.
 
 ========
 

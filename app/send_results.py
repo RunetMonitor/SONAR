@@ -16,7 +16,19 @@ run.py always passes the CSV path explicitly after a run.
 Re-send asks for the one-time token again (no re-scan, no config editing).
 """
 
-from __future__ import annotations
+import sys
+from pathlib import Path
+
+_APP_DIR = Path(__file__).resolve().parent
+_ROOT_DIR = _APP_DIR.parent
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
+if str(_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(_APP_DIR))
+
+from require_runtime import require_runtime
+
+require_runtime()
 
 import csv
 import glob
@@ -26,21 +38,12 @@ import re
 import secrets
 import ssl
 import struct
-import sys
 import urllib.error
 import urllib.request
 import zipfile
 import zlib
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-_APP_DIR = Path(__file__).resolve().parent
-_ROOT_DIR = _APP_DIR.parent
-if str(_ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(_ROOT_DIR))
-if str(_APP_DIR) not in sys.path:
-    sys.path.insert(0, str(_APP_DIR))
 
 from run import get_system_dns_servers
 from config import (
@@ -67,6 +70,9 @@ STRIP_EMPTY_DOMAIN_FIELDS = True
 _SCRIPT_DIR = _ROOT_DIR
 
 _JSON_KWARGS: Dict[str, Any] = {"separators": (",", ":"), "ensure_ascii": False}
+
+# ZIP APPNOTE 4.4.4 bit 0. zipfile._MASK_ENCRYPTED exists only in Python 3.11+.
+_ZIP_FLAG_ENCRYPTED = 0x0001
 
 STATUS_MAP = {
     "YES": "accessible",
@@ -176,7 +182,7 @@ def _payload_zip_bytes(payload: Dict[str, Any], zip_password: str) -> bytes:
 
     zinfo = zipfile.ZipInfo("payload.json", datetime.now().timetuple()[:6])
     zinfo.compress_type = zipfile.ZIP_DEFLATED
-    zinfo.flag_bits = zipfile._MASK_ENCRYPTED
+    zinfo.flag_bits = _ZIP_FLAG_ENCRYPTED
     zinfo.CRC = crc
     zinfo.compress_size = len(encrypted_body)
     zinfo.file_size = len(raw)

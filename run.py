@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 
+import os
+import sys
+
+_APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app")
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
+
+# Before config.py: that file uses postponed annotations (Python 3.7+).
+from require_runtime import require_runtime
+
+require_runtime()
+
 import csv
 import glob
 import hashlib
 import json
-import os
 import random
 import re
 import socket
 import ssl
 import struct
 import subprocess
-import sys
 import threading
 import time
 import urllib.error
@@ -19,10 +29,6 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urlparse
-
-_APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app")
-if _APP_DIR not in sys.path:
-    sys.path.insert(0, _APP_DIR)
 
 from banner import print_banner
 from config import (
@@ -684,6 +690,31 @@ def find_list_files(directory):
     pattern = os.path.join(directory, URL_CHECK_LISTS_DIR, "list_*")
     return sorted(glob.glob(pattern))
 
+
+def _require_scan_ready(script_dir):
+    """Domain lists present and results/ writable. Call before the token prompt."""
+    list_files = find_list_files(script_dir)
+    if not list_files:
+        print(
+            "ERROR: no files starting with 'list_' found in {}/{}".format(
+                script_dir, URL_CHECK_LISTS_DIR
+            )
+        )
+        pause_if_windows()
+        sys.exit(1)
+    results_dir = os.path.join(script_dir, RESULTS_DIR)
+    probe = os.path.join(results_dir, ".sonar_write_check")
+    try:
+        os.makedirs(results_dir, exist_ok=True)
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        os.remove(probe)
+    except OSError as exc:
+        print("ERROR: cannot write to {}: {}".format(results_dir, exc))
+        pause_if_windows()
+        sys.exit(1)
+    return list_files
+
 def _to_punycode(domain):
     try:
         return domain.encode("idna").decode("ascii")
@@ -968,6 +999,8 @@ def main():
         _print_version_block(ver, remote)
         return
 
+    list_files = _require_scan_ready(script_dir)
+
     # Volunteer UX: token before scan. Empty = local CSV only.
     upload_token = prompt_upload_token_before_scan()
 
@@ -995,16 +1028,6 @@ def main():
     print("  Workers    : {}".format(MAX_WORKERS))
     print("  Output     : {}/{}".format(RESULTS_DIR, OUTPUT_CSV))
     print()
-
-    list_files = find_list_files(script_dir)
-    if not list_files:
-        print(
-            "ERROR: no files starting with 'list_' found in {}/{}".format(
-                script_dir, URL_CHECK_LISTS_DIR
-            )
-        )
-        pause_if_windows()
-        sys.exit(1)
 
     tasks = []
     seen = set()
