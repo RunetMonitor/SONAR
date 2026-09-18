@@ -45,7 +45,9 @@ What happens when you run
 1. The script reminds you to run without VPN, on a network cable from  
    your ISP (not a mobile hotspot).  
    If a newer version exists, it says so in uppercase at the start  
-   and again at the end (GitHub/CDNs; if those are blocked, it stays quiet).
+   and waits: type y then Enter to continue with this old version,  
+   or n (or just Enter) to stop. The notice is printed again at the  
+   end. GitHub/CDNs; if those are blocked, it stays quiet.
 2. It asks for your one-time upload token before the scan.  
    - Paste the token from Helpdesk / support to scan and upload.  
    - Leave empty for a local-only scan (CSV saved, no upload).

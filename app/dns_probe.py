@@ -16,6 +16,9 @@ CODE_REFUSED = "refused"
 CODE_TIMEOUT = "timeout"
 CODE_ERROR = "error"
 
+QTYPE_A = 1
+QTYPE_AAAA = 28
+
 _CODE_TOKEN = {
     CODE_NXDOMAIN: "NX",
     CODE_NOANSWER: "NA",
@@ -55,7 +58,7 @@ Outcome = collections.namedtuple("Outcome", "code ips attempts elapsed_ms confli
 ProbeResult = collections.namedtuple(
     "ProbeResult",
     "by_domain resolvers dead elapsed domains queries_total queries_done "
-    "conflicts unmatched stopped_early",
+    "conflicts unmatched stopped_early by_domain_aaaa qtypes",
 )
 
 _rng = random.SystemRandom()
@@ -150,9 +153,9 @@ def question_key(domain):
     return (domain or "").strip().rstrip(".").lower().encode("ascii", "ignore")
 
 
-def build_query(qname, tx_id):
+def build_query(qname, tx_id, qtype=QTYPE_A):
     header = struct.pack(">HHHHHH", tx_id, 0x0100, 1, 0, 0, 0)
-    return header + qname + struct.pack(">HH", 1, 1)
+    return header + qname + struct.pack(">HH", qtype, 1)
 
 
 def _read_qname(data, offset):
@@ -199,7 +202,8 @@ def _same_answer(outcome, code, ips):
     return tuple(sorted(outcome.ips)) == tuple(sorted(ips))
 
 
-def parse_response(data, expected_tx_id, expected_question):
+def parse_response(
+        data, expected_tx_id, expected_question, expected_qtype=QTYPE_A):
     # None = not a reply to this query (wrong id, wrong name, garbage)
     if len(data) < 12:
         return None
@@ -218,7 +222,12 @@ def parse_response(data, expected_tx_id, expected_question):
             return None
         qtype, qclass = struct.unpack(">HH", data[offset:offset + 4])
         offset += 4
-        if index == 0 and qtype == 1 and qclass == 1 and name == expected_question:
+        if (
+            index == 0
+            and qtype == expected_qtype
+            and qclass == 1
+            and name == expected_question
+        ):
             question_ok = True
     if not question_ok:
         return None
@@ -236,10 +245,60 @@ def parse_response(data, expected_tx_id, expected_question):
         offset += 10
         if offset + rdlength > len(data):
             break
-        if rtype == 1 and rdlength == 4:
-            ips.append(".".join(str(b) for b in data[offset:offset + 4]))
+        rdata = data[offset:offset + rdlength]
+        if expected_qtype == QTYPE_A and rtype == QTYPE_A and rdlength == 4:
+            ips.append(".".join(str(b) for b in rdata))
+        elif (
+            expected_qtype == QTYPE_AAAA
+            and rtype == QTYPE_AAAA
+            and rdlength == 16
+        ):
+            try:
+                ips.append(socket.inet_ntop(socket.AF_INET6, rdata))
+            except (OSError, ValueError):
+                pass
         offset += rdlength
     return rcode, ips
+
+
+def query_nameserver(domain, ip, timeout, qtype=QTYPE_A, port=DNS_PORT):
+    """One UDP query to ``ip``. Returns ``(code, ips)``. Never raises."""
+    family = _family_of(ip)
+    if family is None:
+        return CODE_ERROR, []
+    try:
+        qname = encode_qname(domain)
+    except (ValueError, UnicodeError):
+        return CODE_ERROR, []
+    tx_id = _rng.randint(0, 0xFFFF)
+    packet = build_query(qname, tx_id, qtype=qtype)
+    sock = None
+    try:
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        sock.settimeout(float(timeout))
+        if family == socket.AF_INET6:
+            endpoint = (ip, port, 0, 0)
+        else:
+            endpoint = (ip, port)
+        sock.sendto(packet, endpoint)
+        data, _from = sock.recvfrom(_MAX_UDP)
+    except socket.timeout:
+        return CODE_TIMEOUT, []
+    except OSError:
+        return CODE_ERROR, []
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    parsed = parse_response(
+        data, tx_id, question_key(domain), expected_qtype=qtype
+    )
+    if parsed is None:
+        return CODE_ERROR, []
+    rcode, ips = parsed
+    return _code_from_reply(rcode, ips), list(ips)
 
 
 class UdpTransport(object):
@@ -318,9 +377,11 @@ class UdpTransport(object):
 
 class _Pending(object):
     __slots__ = ("domain", "qname", "question", "res_index", "attempt",
-                 "deadline", "started", "awaiting_send", "settled", "tx_ids")
+                 "deadline", "started", "awaiting_send", "settled", "tx_ids",
+                 "qtype")
 
-    def __init__(self, domain, qname, question, res_index, started):
+    def __init__(self, domain, qname, question, res_index, started,
+                 qtype=QTYPE_A):
         self.domain = domain
         self.qname = qname
         self.question = question
@@ -331,12 +392,14 @@ class _Pending(object):
         self.awaiting_send = True
         self.settled = False
         self.tx_ids = []
+        self.qtype = qtype
 
 
 class _Prober(object):
     def __init__(self, domains, resolvers, timeout, attempts, qps_by_kind,
                  max_inflight, max_inflight_per_server, breaker_failures,
-                 max_seconds, stop_event, progress, transport, clock):
+                 max_seconds, stop_event, progress, transport, clock,
+                 qtypes=None):
         self.timeout = max(0.05, float(timeout))
         self.attempts = max(1, int(attempts))
         self.qps_by_kind = qps_by_kind
@@ -348,10 +411,14 @@ class _Prober(object):
         self.progress = progress
         self.clock = clock
         self.transport = transport
+        if qtypes is None:
+            qtypes = (QTYPE_A, QTYPE_AAAA)
+        self.qtypes = tuple(qtypes) or (QTYPE_A,)
 
         self.resolvers = []
-        self.domains = []
+        self.jobs = []
         self.by_domain = {}
+        self.by_aaaa = {}
         self.dead = []
         self.conflicts = 0
         self.unmatched = 0
@@ -385,11 +452,18 @@ class _Prober(object):
                     (r.slug, Outcome(CODE_ERROR, (), 0, 0.0, False))
                     for r in usable
                 )
-                self.queries_done += len(usable)
+                if QTYPE_AAAA in self.qtypes:
+                    self.by_aaaa[name] = dict(self.by_domain[name])
+                self.queries_done += len(usable) * len(self.qtypes)
                 continue
             encoded.append((name, qname, question_key(name)))
             self.by_domain.setdefault(name, {})
-        self.domains = encoded
+            if QTYPE_AAAA in self.qtypes:
+                self.by_aaaa.setdefault(name, {})
+        self.jobs = []
+        for name, qname, question in encoded:
+            for qtype in self.qtypes:
+                self.jobs.append((name, qname, question, qtype))
 
         size = self.count
         self.queue_pos = [0] * size
@@ -404,7 +478,7 @@ class _Prober(object):
         self.recent = {}
         self.conflicted = set()
         self._last_sweep = 0.0
-        self.queries_total = len(self.domains) * size + self.queries_done
+        self.queries_total = len(self.jobs) * size + self.queries_done
 
     def _qps(self, index):
         kind = self.resolvers[index].kind
@@ -460,6 +534,8 @@ class _Prober(object):
             conflicts=self.conflicts,
             unmatched=self.unmatched,
             stopped_early=self.stopped_early,
+            by_domain_aaaa=self.by_aaaa,
+            qtypes=self.qtypes,
         )
 
     def _queues_drained(self):
@@ -468,7 +544,7 @@ class _Prober(object):
                 continue
             if self.retry_queue[index]:
                 return False
-            if self.queue_pos[index] < len(self.domains):
+            if self.queue_pos[index] < len(self.jobs):
                 return False
         return True
 
@@ -502,15 +578,15 @@ class _Prober(object):
                     break
                 if self._total_inflight() >= self.max_inflight:
                     break
-                if self.queue_pos[index] >= len(self.domains):
+                if self.queue_pos[index] >= len(self.jobs):
                     break
-                name, qname, question = self.domains[self.queue_pos[index]]
-                pending = _Pending(name, qname, question, index, now)
-                self.active[(index, name)] = pending
+                name, qname, question, qtype = self.jobs[self.queue_pos[index]]
+                pending = _Pending(name, qname, question, index, now, qtype)
+                self.active[(index, name, qtype)] = pending
                 self.inflight_n[index] += 1
                 state = self._transmit(pending, now)
                 if state == _SEND_AGAIN:
-                    del self.active[(index, name)]
+                    del self.active[(index, name, qtype)]
                     self.inflight_n[index] -= 1
                     break
                 self.queue_pos[index] += 1
@@ -522,7 +598,9 @@ class _Prober(object):
         tx_id = self._new_tx_id(index)
         try:
             self.transport.send(
-                res.family, build_query(pending.qname, tx_id), udp_endpoint(res)
+                res.family,
+                build_query(pending.qname, tx_id, qtype=pending.qtype),
+                udp_endpoint(res),
             )
         except (BlockingIOError, InterruptedError):
             return _SEND_AGAIN
@@ -557,9 +635,11 @@ class _Prober(object):
             if previous is None:
                 self.unmatched += 1
                 return
-            self._note_conflict(index, previous[0], data, tx_id)
+            self._note_conflict(index, previous, data, tx_id)
             return
-        parsed = parse_response(data, tx_id, pending.question)
+        parsed = parse_response(
+            data, tx_id, pending.question, expected_qtype=pending.qtype
+        )
         if parsed is None:
             self.unmatched += 1
             return
@@ -568,18 +648,27 @@ class _Prober(object):
         self.consec_fail[index] = 0
         self._settle(pending, code, tuple(ips), now)
 
-    def _note_conflict(self, index, domain, data, tx_id):
-        parsed = parse_response(data, tx_id, question_key(domain))
+    def _store_for(self, qtype):
+        if qtype == QTYPE_AAAA:
+            return self.by_aaaa
+        return self.by_domain
+
+    def _note_conflict(self, index, previous, data, tx_id):
+        domain = previous[0]
+        qtype = previous[1] if len(previous) > 2 else QTYPE_A
+        parsed = parse_response(
+            data, tx_id, question_key(domain), expected_qtype=qtype
+        )
         if parsed is None:
             self.unmatched += 1
             return
         rcode, ips = parsed
         code = _code_from_reply(rcode, ips)
         slug = self.resolvers[index].slug
-        first = self.by_domain.get(domain, {}).get(slug)
+        first = self._store_for(qtype).get(domain, {}).get(slug)
         if first is None or _same_answer(first, code, ips):
             return
-        self.conflicted.add((index, domain))
+        self.conflicted.add((index, domain, qtype))
         self.conflicts += 1
 
     def _expire(self, now):
@@ -601,11 +690,13 @@ class _Prober(object):
         index = pending.res_index
         slug = self.resolvers[index].slug
         elapsed_ms = max(0.0, (now - pending.started) * 1000.0)
-        self.by_domain.setdefault(pending.domain, {})[slug] = Outcome(
+        self._store_for(pending.qtype).setdefault(pending.domain, {})[slug] = Outcome(
             code, ips, pending.attempt, elapsed_ms, False
         )
         self.queries_done += 1
-        if self.active.pop((index, pending.domain), None) is not None:
+        if self.active.pop(
+            (index, pending.domain, pending.qtype), None
+        ) is not None:
             self.inflight_n[index] -= 1
         self._retire_tx_ids(pending, now)
 
@@ -614,14 +705,14 @@ class _Prober(object):
         expiry = now + _CONFLICT_WINDOW
         for tx_id in pending.tx_ids:
             self.txmap.pop((index, tx_id), None)
-            self.recent[(index, tx_id)] = (pending.domain, expiry)
+            self.recent[(index, tx_id)] = (pending.domain, pending.qtype, expiry)
         pending.tx_ids = []
 
     def _sweep_recent(self, now):
         if now - self._last_sweep < _SWEEP_INTERVAL:
             return
         self._last_sweep = now
-        for key in [k for k, v in self.recent.items() if v[1] <= now]:
+        for key in [k for k, v in self.recent.items() if v[-1] <= now]:
             self.recent.pop(key, None)
 
     def _register_failure(self, index):
@@ -629,7 +720,7 @@ class _Prober(object):
         if self.dead[index] or self.consec_fail[index] < self.breaker_failures:
             return
         self.dead[index] = True
-        self.queue_pos[index] = len(self.domains)
+        self.queue_pos[index] = len(self.jobs)
         now = self.clock()
         queued = list(self.retry_queue[index])
         self.retry_queue[index].clear()
@@ -646,7 +737,7 @@ class _Prober(object):
             if self.dead[index] or self.tokens[index] >= 1.0:
                 continue
             if not self.retry_queue[index] and self.queue_pos[index] >= len(
-                self.domains
+                self.jobs
             ):
                 continue
             need = (1.0 - self.tokens[index]) / self._qps(index)
@@ -657,19 +748,25 @@ class _Prober(object):
         now = self.clock()
         for pending in list(self.active.values()):
             self._settle(pending, CODE_TIMEOUT, (), now)
-        for index, domain in self.conflicted:
+        for item in self.conflicted:
+            if len(item) == 2:
+                index, domain = item
+                qtype = QTYPE_A
+            else:
+                index, domain, qtype = item
             if index >= self.count:
                 continue
             slug = self.resolvers[index].slug
-            outcome = self.by_domain.get(domain, {}).get(slug)
+            store = self._store_for(qtype)
+            outcome = store.get(domain, {}).get(slug)
             if outcome is not None:
-                self.by_domain[domain][slug] = outcome._replace(conflict=True)
+                store[domain][slug] = outcome._replace(conflict=True)
 
 
 def probe(domains, resolvers, timeout=1.5, attempts=3, qps_by_kind=None,
           max_inflight=600, max_inflight_per_server=100, breaker_failures=15,
           max_seconds=300.0, stop_event=None, progress=None, transport=None,
-          clock=None):
+          clock=None, qtypes=None):
     if qps_by_kind is None:
         qps_by_kind = {KIND_GLOBAL: 40.0, KIND_RUSSIAN: 15.0, KIND_NSDI: 15.0}
     own_transport = transport is None
@@ -689,6 +786,7 @@ def probe(domains, resolvers, timeout=1.5, attempts=3, qps_by_kind=None,
             progress=progress,
             transport=transport,
             clock=clock or time.monotonic,
+            qtypes=qtypes,
         )
         return prober.run()
     finally:
@@ -704,9 +802,18 @@ COLUMNS = (
     "dns_probe_variants",
 )
 
+IPV6_COLUMNS = (
+    "dns_probe_ok_ipv6",
+    "dns_probe_total_ipv6",
+    "dns_probe_nsdi_ipv6",
+    "dns_probe_detail_ipv6",
+    "dns_probe_variants_ipv6",
+)
+
 META_COLUMNS = ("dns_probe_resolvers", "dns_probe_meta")
 
 EMPTY_COLUMNS = dict((name, "") for name in COLUMNS)
+EMPTY_IPV6_COLUMNS = dict((name, "") for name in IPV6_COLUMNS)
 
 META_VERSION = "1"
 
@@ -720,9 +827,10 @@ def _variant_letter(index):
     return letters
 
 
-def format_columns(outcomes, resolvers):
+def format_columns(outcomes, resolvers, suffix=""):
     if not outcomes:
-        return dict(EMPTY_COLUMNS)
+        names = IPV6_COLUMNS if suffix == "_ipv6" else COLUMNS
+        return dict((name, "") for name in names)
 
     order = []
     counts = {}
@@ -773,11 +881,11 @@ def format_columns(outcomes, resolvers):
         nsdi = next(code for code in nsdi_codes if code != CODE_OK)
 
     return {
-        "dns_probe_ok": str(resolved),
-        "dns_probe_total": str(probed),
-        "dns_probe_nsdi": nsdi,
-        "dns_probe_detail": ";".join(detail),
-        "dns_probe_variants": variants,
+        "dns_probe_ok" + suffix: str(resolved),
+        "dns_probe_total" + suffix: str(probed),
+        "dns_probe_nsdi" + suffix: nsdi,
+        "dns_probe_detail" + suffix: ";".join(detail),
+        "dns_probe_variants" + suffix: variants,
     }
 
 
@@ -798,6 +906,15 @@ def format_meta(result):
         ("unmatched", str(result.unmatched)),
         ("partial", "1" if result.stopped_early else "0"),
     ]
+    qtypes = getattr(result, "qtypes", None) or ()
+    if qtypes:
+        labels = []
+        for qtype in qtypes:
+            if qtype == QTYPE_AAAA:
+                labels.append("AAAA")
+            else:
+                labels.append("A")
+        fields.append(("qtypes", ",".join(labels)))
     if result.dead:
         fields.append(("dead", ",".join(result.dead)))
     return ";".join("{}={}".format(k, v) for k, v in fields)

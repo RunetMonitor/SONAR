@@ -48,6 +48,12 @@ def _load_send_results():
 sr = _load_send_results()
 
 
+def _silence_local_dns(monkeypatch, code="", ips=None):
+    """Keep check_domain tests off the network (raw UDP rcode query)."""
+    ips = list(ips or [])
+    monkeypatch.setattr(run, "query_local_dns", lambda *a, **k: (code, list(ips)))
+
+
 # ---------------------------------------------------------------------------
 # Part 1 - config / secrets scrub
 # ---------------------------------------------------------------------------
@@ -525,6 +531,44 @@ class TestVersionCheck:
         run._print_update_notice("1.3.0", "")
         run._print_update_notice("", "1.9.0")
         assert capsys.readouterr().out == ""
+
+    def test_outdated_prompt_skips_input_when_not_newer(self, monkeypatch):
+        monkeypatch.setattr(
+            "builtins.input",
+            mock.Mock(side_effect=AssertionError("must not ask")),
+        )
+        assert run._prompt_continue_if_outdated("1.3.0", "1.3.0") is True
+        assert run._prompt_continue_if_outdated("1.3.0", "") is True
+        assert run._prompt_continue_if_outdated("1.3.0", None) is True
+        assert run._prompt_continue_if_outdated("", "1.9.0") is True
+
+    def test_outdated_prompt_yes_continues(self, monkeypatch, capsys):
+        monkeypatch.setattr("builtins.input", lambda *_a: "Y")
+        assert run._prompt_continue_if_outdated("1.2.0", "1.3.0") is True
+        out = capsys.readouterr().out
+        assert "Continue with this old version?" in out
+        assert "[y/N]" in out
+
+    def test_outdated_prompt_yes_word_continues(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda *_a: "  yes  ")
+        assert run._prompt_continue_if_outdated("1.2.0", "1.3.0") is True
+
+    def test_outdated_prompt_empty_or_no_stops(self, monkeypatch, capsys):
+        monkeypatch.setattr("builtins.input", lambda *_a: "")
+        assert run._prompt_continue_if_outdated("1.2.0", "1.3.0") is False
+        monkeypatch.setattr("builtins.input", lambda *_a: "n")
+        assert run._prompt_continue_if_outdated("1.2.0", "1.3.0") is False
+        monkeypatch.setattr("builtins.input", lambda *_a: "nope")
+        assert run._prompt_continue_if_outdated("1.2.0", "1.3.0") is False
+        out = capsys.readouterr().out
+        assert "Stopped." in out
+
+    def test_outdated_prompt_eof_stops(self, monkeypatch):
+        def _eof(*_a):
+            raise EOFError()
+
+        monkeypatch.setattr("builtins.input", _eof)
+        assert run._prompt_continue_if_outdated("1.2.0", "1.3.0") is False
 
     def test_fetch_uses_another_url_when_the_first_fails(self, monkeypatch):
         calls = []
@@ -1431,6 +1475,10 @@ class TestCheckHttp:
 
 
 class TestCheckDomain:
+    @pytest.fixture(autouse=True)
+    def _no_network_rcode(self, monkeypatch):
+        _silence_local_dns(monkeypatch)
+
     def test_dns_failure(self, monkeypatch):
         monkeypatch.setattr(
             run, "resolve_dns", mock.Mock(side_effect=OSError("fail"))
@@ -1511,6 +1559,10 @@ def _http_result(status=200, size=100, error="", protocol="https", redirect=None
 
 
 class TestCheckDomainIpFamilies:
+    @pytest.fixture(autouse=True)
+    def _no_network_rcode(self, monkeypatch):
+        _silence_local_dns(monkeypatch)
+
     def test_ipv4_blocked_ipv6_open(self, monkeypatch):
         monkeypatch.setattr(run, "_host_has_ipv6", lambda: True)
 
@@ -1817,6 +1869,24 @@ class TestSendResultsPayload:
         assert domains[0]["status"] == "accessible"
         assert "empty_should_strip" not in domains[0]
         assert domains[1]["status"] == "blocked"
+
+    def test_dns_rcode_travels_in_domain_entry(self, monkeypatch):
+        monkeypatch.setattr(sr, "get_dns_servers", lambda: [])
+        rows = [
+            {
+                "domain": "alice-vpn.com",
+                "accessible": "NO",
+                "dns_error": "[Errno 8] nodename nor servname provided, or not known",
+                "dns_rcode": "nxdomain",
+                "dns_rcode_ipv6": "noanswer",
+                "source_file": "list_blocked_nsdi.txt",
+            }
+        ]
+        payload = sr._build_payload(rows, Path("check_results_x.csv"))
+        entry = payload["result_data"]["domains"][0]
+        assert entry["dns_rcode"] == "nxdomain"
+        assert entry["dns_rcode_ipv6"] == "noanswer"
+        assert entry["status"] == "blocked"
 
     def test_get_dns_servers_custom(self, monkeypatch):
         monkeypatch.setattr(sr, "DNS_SERVER", "1.2.3.4")
@@ -2228,8 +2298,12 @@ class TestCsvNoIpPersistence:
         fieldnames = run.result_csv_fieldnames(include_dns_probe=False)
         assert "check_ip_address" not in fieldnames
         assert "sonar_id" in fieldnames
-        assert "accessible" in fieldnames
-        assert "accessible_ipv6" in fieldnames
+        assert "dns_rcode" in fieldnames
+        assert "dns_rcode_ipv6" in fieldnames
+        assert fieldnames.index("dns_error") < fieldnames.index("dns_rcode")
+        assert fieldnames.index("dns_error_ipv6") < fieldnames.index(
+            "dns_rcode_ipv6"
+        )
         assert fieldnames.index("accessible") < fieldnames.index("accessible_ipv6")
         path = tmp_path / "out.csv"
         with open(path, "w", newline="", encoding="utf-8") as fh:
@@ -2952,6 +3026,10 @@ class TestCheckHttpSslExtra:
 
 
 class TestCheckDomainExtra:
+    @pytest.fixture(autouse=True)
+    def _no_network_rcode(self, monkeypatch):
+        _silence_local_dns(monkeypatch)
+
     def test_ssl_raises(self, monkeypatch):
         monkeypatch.setattr(run, "resolve_dns", mock.Mock(return_value=["1.2.3.4"]))
         monkeypatch.setattr(
@@ -3017,6 +3095,428 @@ class TestCheckDomainExtra:
         row = run.check_domain("example.com", "list_x.txt")
         assert "http boom" in row["http_error"]
         assert row["accessible"] == "NO"
+
+
+class TestQueryLocalDns:
+    def test_no_servers_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: [])
+        assert run.query_local_dns("example.com") == ("", [])
+
+    def test_blank_servers_are_ignored(self, monkeypatch):
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: ["", "  "])
+        assert run.query_local_dns("example.com") == ("", [])
+
+    def test_without_dns_probe_module(self, monkeypatch):
+        monkeypatch.setattr(run, "dns_probe", None)
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: ["8.8.8.8"])
+        assert run.query_local_dns("example.com") == ("", [])
+
+    def test_skips_timeout_then_keeps_nxdomain(self, monkeypatch):
+        calls = []
+
+        def fake(domain, ip, timeout, qtype=dns_probe.QTYPE_A, port=53):
+            calls.append(ip)
+            if ip == "1.1.1.1":
+                return dns_probe.CODE_TIMEOUT, []
+            return dns_probe.CODE_NXDOMAIN, []
+
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: ["1.1.1.1", "8.8.8.8"])
+        monkeypatch.setattr(dns_probe, "query_nameserver", fake)
+        code, ips = run.query_local_dns("blocked.test")
+        assert code == dns_probe.CODE_NXDOMAIN
+        assert ips == []
+        assert calls == ["1.1.1.1", "8.8.8.8"]
+
+    def test_does_not_fall_through_after_nxdomain(self, monkeypatch):
+        calls = []
+
+        def fake(domain, ip, timeout, qtype=dns_probe.QTYPE_A, port=53):
+            calls.append(ip)
+            return dns_probe.CODE_NXDOMAIN, []
+
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: ["1.1.1.1", "8.8.8.8"])
+        monkeypatch.setattr(dns_probe, "query_nameserver", fake)
+        assert run.query_local_dns("blocked.test")[0] == dns_probe.CODE_NXDOMAIN
+        assert calls == ["1.1.1.1"]
+
+    def test_explicit_server_only(self, monkeypatch):
+        seen = []
+
+        def fake(domain, ip, timeout, qtype=dns_probe.QTYPE_A, port=53):
+            seen.append((domain, ip, qtype))
+            return dns_probe.CODE_OK, ["9.9.9.9"]
+
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: ["1.1.1.1"])
+        monkeypatch.setattr(dns_probe, "query_nameserver", fake)
+        code, ips = run.query_local_dns(
+            "example.com", qtype=dns_probe.QTYPE_AAAA, server="8.8.8.8"
+        )
+        assert (code, ips) == (dns_probe.CODE_OK, ["9.9.9.9"])
+        assert seen == [("example.com", "8.8.8.8", dns_probe.QTYPE_AAAA)]
+
+    def test_query_exception_then_success(self, monkeypatch):
+        def fake(domain, ip, timeout, qtype=dns_probe.QTYPE_A, port=53):
+            if ip == "1.1.1.1":
+                raise RuntimeError("boom")
+            return dns_probe.CODE_REFUSED, []
+
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: ["1.1.1.1", "9.9.9.9"])
+        monkeypatch.setattr(dns_probe, "query_nameserver", fake)
+        assert run.query_local_dns("example.com")[0] == dns_probe.CODE_REFUSED
+
+    def test_all_timeouts_surface_timeout(self, monkeypatch):
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: ["1.1.1.1"])
+        monkeypatch.setattr(
+            dns_probe,
+            "query_nameserver",
+            lambda *a, **k: (dns_probe.CODE_TIMEOUT, []),
+        )
+        assert run.query_local_dns("example.com") == (dns_probe.CODE_TIMEOUT, [])
+
+
+class _ScriptedUdpSocket:
+    def __init__(self, reply_builder=None, recv_error=None, send_error=None):
+        self.reply_builder = reply_builder
+        self.recv_error = recv_error
+        self.send_error = send_error
+        self.sent = []
+        self.closed = False
+        self.timeout = None
+        self._reply = None
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def sendto(self, data, addr):
+        if self.send_error is not None:
+            raise self.send_error
+        self.sent.append((data, addr))
+        if self.reply_builder is not None:
+            self._reply = self.reply_builder(data)
+
+    def recvfrom(self, _n):
+        if self.recv_error is not None:
+            raise self.recv_error
+        if self._reply is None:
+            raise socket.timeout("timed out")
+        return self._reply, ("8.8.8.8", 53)
+
+    def close(self):
+        self.closed = True
+
+
+class TestQueryNameserver:
+    def _patch_socket(self, monkeypatch, sock):
+        created = []
+
+        def factory(family, typ):
+            sock.family = family
+            sock.typ = typ
+            created.append(sock)
+            return sock
+
+        monkeypatch.setattr(dns_probe.socket, "socket", factory)
+        monkeypatch.setattr(dns_probe, "_rng", type("R", (), {"randint": staticmethod(lambda a, b: 0x4242)})())
+        return created
+
+    def test_ok_a_records(self, monkeypatch):
+        sock = _ScriptedUdpSocket(
+            reply_builder=lambda q: _dns_reply(q, ips=["1.2.3.4", "5.6.7.8"])
+        )
+        self._patch_socket(monkeypatch, sock)
+        code, ips = dns_probe.query_nameserver("example.com", "8.8.8.8", 1)
+        assert code == dns_probe.CODE_OK
+        assert ips == ["1.2.3.4", "5.6.7.8"]
+        assert sock.closed is True
+        qtype = struct.unpack(">H", sock.sent[0][0][-4:-2])[0]
+        assert qtype == dns_probe.QTYPE_A
+        assert sock.sent[0][1] == ("8.8.8.8", 53)
+
+    def test_nxdomain_distinct_from_noanswer(self, monkeypatch):
+        nx_sock = _ScriptedUdpSocket(reply_builder=lambda q: _dns_reply(q, rcode=3))
+        self._patch_socket(monkeypatch, nx_sock)
+        assert dns_probe.query_nameserver("x.test", "8.8.8.8", 1) == (
+            dns_probe.CODE_NXDOMAIN,
+            [],
+        )
+
+        empty_sock = _ScriptedUdpSocket(reply_builder=lambda q: _dns_reply(q))
+        self._patch_socket(monkeypatch, empty_sock)
+        assert dns_probe.query_nameserver("x.test", "8.8.8.8", 1) == (
+            dns_probe.CODE_NOANSWER,
+            [],
+        )
+
+    def test_servfail_and_refused(self, monkeypatch):
+        sock = _ScriptedUdpSocket(reply_builder=lambda q: _dns_reply(q, rcode=2))
+        self._patch_socket(monkeypatch, sock)
+        assert dns_probe.query_nameserver("x.test", "8.8.8.8", 1)[0] == (
+            dns_probe.CODE_SERVFAIL
+        )
+        sock = _ScriptedUdpSocket(reply_builder=lambda q: _dns_reply(q, rcode=5))
+        self._patch_socket(monkeypatch, sock)
+        assert dns_probe.query_nameserver("x.test", "8.8.8.8", 1)[0] == (
+            dns_probe.CODE_REFUSED
+        )
+
+    def test_unknown_rcode_is_error(self, monkeypatch):
+        sock = _ScriptedUdpSocket(reply_builder=lambda q: _dns_reply(q, rcode=1))
+        self._patch_socket(monkeypatch, sock)
+        assert dns_probe.query_nameserver("x.test", "8.8.8.8", 1) == (
+            dns_probe.CODE_ERROR,
+            [],
+        )
+
+    def test_aaaa_ok(self, monkeypatch):
+        sock = _ScriptedUdpSocket(
+            reply_builder=lambda q: _dns_reply(q, ips=["2001:db8::1"])
+        )
+        self._patch_socket(monkeypatch, sock)
+        code, ips = dns_probe.query_nameserver(
+            "example.com", "8.8.8.8", 1, qtype=dns_probe.QTYPE_AAAA
+        )
+        assert code == dns_probe.CODE_OK
+        assert ips == ["2001:db8::1"]
+        qtype = struct.unpack(">H", sock.sent[0][0][-4:-2])[0]
+        assert qtype == dns_probe.QTYPE_AAAA
+
+    def test_timeout_and_oserror_and_garbage(self, monkeypatch):
+        sock = _ScriptedUdpSocket(recv_error=socket.timeout("t"))
+        self._patch_socket(monkeypatch, sock)
+        assert dns_probe.query_nameserver("example.com", "8.8.8.8", 1) == (
+            dns_probe.CODE_TIMEOUT,
+            [],
+        )
+        assert sock.closed is True
+
+        sock = _ScriptedUdpSocket(send_error=OSError("down"))
+        self._patch_socket(monkeypatch, sock)
+        assert dns_probe.query_nameserver("example.com", "8.8.8.8", 1) == (
+            dns_probe.CODE_ERROR,
+            [],
+        )
+        assert sock.closed is True
+
+        sock = _ScriptedUdpSocket(reply_builder=lambda q: b"nope")
+        self._patch_socket(monkeypatch, sock)
+        assert dns_probe.query_nameserver("example.com", "8.8.8.8", 1) == (
+            dns_probe.CODE_ERROR,
+            [],
+        )
+
+    def test_close_oserror_is_ignored(self, monkeypatch):
+        sock = _ScriptedUdpSocket(
+            reply_builder=lambda q: _dns_reply(q, ips=["1.2.3.4"])
+        )
+
+        def boom():
+            sock.closed = True
+            raise OSError("already closed")
+
+        sock.close = boom
+        self._patch_socket(monkeypatch, sock)
+        code, ips = dns_probe.query_nameserver("example.com", "8.8.8.8", 1)
+        assert code == dns_probe.CODE_OK
+        assert ips == ["1.2.3.4"]
+        assert sock.closed is True
+
+    def test_bad_inputs(self):
+        assert dns_probe.query_nameserver("example.com", "not-an-ip", 1) == (
+            dns_probe.CODE_ERROR,
+            [],
+        )
+        assert dns_probe.query_nameserver("", "8.8.8.8", 1) == (
+            dns_probe.CODE_ERROR,
+            [],
+        )
+
+    def test_ipv6_nameserver_endpoint(self, monkeypatch):
+        sock = _ScriptedUdpSocket(reply_builder=lambda q: _dns_reply(q, rcode=3))
+        self._patch_socket(monkeypatch, sock)
+        dns_probe.query_nameserver("x.test", "2001:db8::53", 1)
+        assert sock.family == socket.AF_INET6
+        assert sock.sent[0][1] == ("2001:db8::53", 53, 0, 0)
+
+
+class TestLocalDnsRcode:
+    def _http_ok(self):
+        return {
+            "status": 200,
+            "size": 10,
+            "url": "https://example.com/",
+            "redirect_url": "https://example.com/",
+            "error": "",
+            "body": b"ok",
+            "protocol": "https",
+        }
+
+    def test_gaierror_records_nxdomain_and_skips_http(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: False)
+        monkeypatch.setattr(
+            run, "resolve_dns", mock.Mock(side_effect=socket.gaierror(8, "nodename"))
+        )
+        http = mock.Mock(return_value=self._http_ok())
+        monkeypatch.setattr(run, "check_http", http)
+        monkeypatch.setattr(
+            run,
+            "query_local_dns",
+            lambda *a, **k: (dns_probe.CODE_NXDOMAIN, []),
+        )
+        row = run.check_domain("alice-vpn.com", "list_blocked_nsdi.txt")
+        assert row["accessible"] == "NO"
+        assert row["dns_rcode"] == dns_probe.CODE_NXDOMAIN
+        assert "skipped" in row["http_error"]
+        assert "nodename" in row["dns_error"]
+        http.assert_not_called()
+
+    def test_gaierror_keeps_sinkhole_ips_without_connecting(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: False)
+        monkeypatch.setattr(
+            run, "resolve_dns", mock.Mock(side_effect=OSError("fail"))
+        )
+        http = mock.Mock(return_value=self._http_ok())
+        monkeypatch.setattr(run, "check_http", http)
+        monkeypatch.setattr(
+            run,
+            "query_local_dns",
+            lambda *a, **k: (dns_probe.CODE_OK, ["188.186.146.208"]),
+        )
+        row = run.check_domain("annas-archive.org", "list_blocked_nsdi.txt")
+        assert row["accessible"] == "NO"
+        assert row["dns_rcode"] == dns_probe.CODE_OK
+        assert row["dns_resolved_ips"] == "188.186.146.208"
+        assert "skipped" in row["http_error"]
+        http.assert_not_called()
+
+    def test_getaddrinfo_ips_win_over_udp_ips(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: False)
+        monkeypatch.setattr(run, "resolve_dns", mock.Mock(return_value=["1.2.3.4"]))
+        monkeypatch.setattr(
+            run, "check_ssl", mock.Mock(return_value=(1.0, True, "I", ""))
+        )
+        monkeypatch.setattr(run, "check_http", mock.Mock(return_value=self._http_ok()))
+        monkeypatch.setattr(
+            run,
+            "query_local_dns",
+            lambda *a, **k: (dns_probe.CODE_OK, ["188.186.146.208"]),
+        )
+        row = run.check_domain("example.com", "list_x.txt")
+        assert row["accessible"] == "YES"
+        assert row["dns_resolved_ips"] == "1.2.3.4"
+        assert row["dns_rcode"] == dns_probe.CODE_OK
+
+    def test_reachable_via_os_but_isp_nxdomain(self, monkeypatch):
+        """DoH/OS stub can succeed while the ISP resolver returns NXDOMAIN."""
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: False)
+        monkeypatch.setattr(run, "resolve_dns", mock.Mock(return_value=["1.2.3.4"]))
+        monkeypatch.setattr(
+            run, "check_ssl", mock.Mock(return_value=(1.0, True, "I", ""))
+        )
+        http = mock.Mock(return_value=self._http_ok())
+        monkeypatch.setattr(run, "check_http", http)
+        monkeypatch.setattr(
+            run,
+            "query_local_dns",
+            lambda *a, **k: (dns_probe.CODE_NXDOMAIN, []),
+        )
+        row = run.check_domain("example.com", "list_x.txt")
+        assert row["accessible"] == "YES"
+        assert row["dns_rcode"] == dns_probe.CODE_NXDOMAIN
+        assert row["dns_resolved_ips"] == "1.2.3.4"
+        http.assert_called()
+
+    def test_servfail_and_refused_and_noanswer(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: False)
+        monkeypatch.setattr(run, "resolve_dns", mock.Mock(return_value=[]))
+        for code in (
+            dns_probe.CODE_SERVFAIL,
+            dns_probe.CODE_REFUSED,
+            dns_probe.CODE_NOANSWER,
+            dns_probe.CODE_TIMEOUT,
+        ):
+            monkeypatch.setattr(
+                run, "query_local_dns", lambda *a, code=code, **k: (code, [])
+            )
+            row = run.check_domain("example.com", "list_x.txt")
+            assert row["dns_rcode"] == code
+            assert row["accessible"] == "NO"
+
+    def test_aaaa_rcode_when_host_has_no_ipv6(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: False)
+        monkeypatch.setattr(run, "resolve_dns", mock.Mock(return_value=["1.2.3.4"]))
+        monkeypatch.setattr(
+            run, "check_ssl", mock.Mock(return_value=(1.0, True, "I", ""))
+        )
+        monkeypatch.setattr(run, "check_http", mock.Mock(return_value=self._http_ok()))
+        seen = []
+
+        def fake(domain, qtype=run.QTYPE_A, server=None, timeout=None):
+            seen.append(qtype)
+            if qtype == run.QTYPE_AAAA:
+                return dns_probe.CODE_NOANSWER, []
+            return dns_probe.CODE_OK, ["1.2.3.4"]
+
+        monkeypatch.setattr(run, "query_local_dns", fake)
+        row = run.check_domain("example.com", "list_x.txt")
+        assert run.QTYPE_A in seen
+        assert run.QTYPE_AAAA in seen
+        assert row["dns_rcode"] == dns_probe.CODE_OK
+        assert row["dns_rcode_ipv6"] == dns_probe.CODE_NOANSWER
+        assert "no IPv6" in row["dns_error_ipv6"]
+
+    def test_udp_aaaa_ips_fill_when_resolve_fails(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: True)
+
+        def fake_resolve(domain, server=None, timeout=None, family=socket.AF_INET):
+            if family == socket.AF_INET6:
+                raise OSError("fail v6")
+            return ["1.2.3.4"]
+
+        monkeypatch.setattr(run, "resolve_dns", fake_resolve)
+        monkeypatch.setattr(
+            run, "check_ssl", mock.Mock(return_value=(1.0, True, "I", ""))
+        )
+        monkeypatch.setattr(run, "check_http", mock.Mock(return_value=self._http_ok()))
+
+        def fake(domain, qtype=run.QTYPE_A, server=None, timeout=None):
+            if qtype == run.QTYPE_AAAA:
+                return dns_probe.CODE_OK, ["2001:db8::9"]
+            return dns_probe.CODE_OK, ["1.2.3.4"]
+
+        monkeypatch.setattr(run, "query_local_dns", fake)
+        row = run.check_domain("example.com", "list_x.txt")
+        assert row["accessible"] == "YES"
+        assert row["accessible_ipv6"] == ""
+        assert row["dns_rcode_ipv6"] == dns_probe.CODE_OK
+        assert row["dns_resolved_ips_ipv6"] == "2001:db8::9"
+        assert "skipped" in row["http_error_ipv6"]
+
+    def test_rcode_failure_does_not_abort_check(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: False)
+        monkeypatch.setattr(run, "resolve_dns", mock.Mock(return_value=["1.2.3.4"]))
+        monkeypatch.setattr(
+            run, "check_ssl", mock.Mock(return_value=(1.0, True, "I", ""))
+        )
+        monkeypatch.setattr(run, "check_http", mock.Mock(return_value=self._http_ok()))
+        monkeypatch.setattr(
+            run, "query_local_dns", mock.Mock(side_effect=RuntimeError("rcode boom"))
+        )
+        row = run.check_domain("example.com", "list_x.txt")
+        assert row["accessible"] == "YES"
+        assert row["dns_rcode"] == ""
+
+    def test_mapped_aaaa_not_stored_as_ipv6(self, monkeypatch):
+        monkeypatch.setattr(run, "_host_has_ipv6", lambda: False)
+        monkeypatch.setattr(run, "resolve_dns", mock.Mock(return_value=[]))
+        monkeypatch.setattr(
+            run,
+            "query_local_dns",
+            lambda *a, **k: (dns_probe.CODE_OK, ["::ffff:1.2.3.4"]),
+        )
+        row = run.check_domain("example.com", "list_x.txt")
+        assert row["dns_rcode"] == dns_probe.CODE_OK
+        # Mapped V4 is not a usable A; leave dns_resolved_ips empty.
+        assert row["dns_resolved_ips"] == ""
 
 
 class TestDetectLocationExtra:
@@ -3316,6 +3816,8 @@ class TestRunMainFlows:
         assert "City, Country" in text
         assert "accessible_ipv6" in text.splitlines()[0]
         assert "sonar_id" in text.splitlines()[0]
+        assert "dns_rcode" in text.splitlines()[0]
+        assert "dns_rcode_ipv6" in text.splitlines()[0]
         rows = list(csv.DictReader(io.StringIO(text)))
         sonar_id = rows[0]["sonar_id"]
         assert len(sonar_id) == 64
@@ -3348,12 +3850,70 @@ class TestRunMainFlows:
         self._stub_check_domain(monkeypatch)
         monkeypatch.setattr(run, "_read_version_text", lambda *_a: "1.2.0")
         monkeypatch.setattr(run, "_fetch_latest_version", lambda: "1.3.0")
+        monkeypatch.setattr("builtins.input", lambda *_a: "y")
         run.main()
         out = capsys.readouterr().out
         assert (
             out.count("A NEWER VERSION OF THIS SCRIPT IS AVAILABLE (1.3.0). YOU HAVE 1.2.0.")
             == 2
         )
+        assert "Continue with this old version?" in out
+
+    def test_update_notice_no_stops_before_scan(self, tmp_path, monkeypatch, capsys):
+        lists = tmp_path / "app" / "url_check_lists"
+        lists.mkdir(parents=True)
+        (lists / "list_a.txt").write_text("a.example\n", encoding="utf-8")
+        monkeypatch.setattr(run, "SKIP_CHECK", False)
+        monkeypatch.setattr(run, "RESULTS_DIR", "results")
+        monkeypatch.setattr(run, "URL_CHECK_LISTS_DIR", "app/url_check_lists")
+        monkeypatch.setattr(run.os.path, "abspath", lambda p: str(tmp_path / "run.py"))
+        monkeypatch.setattr(run.os.path, "dirname", lambda p: str(tmp_path))
+        monkeypatch.setattr(run, "pause_if_windows", lambda: None)
+        monkeypatch.setattr(
+            run,
+            "prompt_upload_token_before_scan",
+            mock.Mock(side_effect=AssertionError("must not ask for token")),
+        )
+        monkeypatch.setattr(run, "_read_version_text", lambda *_a: "1.2.0")
+        monkeypatch.setattr(run, "_fetch_latest_version", lambda: "1.3.0")
+        monkeypatch.setattr("builtins.input", lambda *_a: "n")
+        with pytest.raises(SystemExit) as ei:
+            run.main()
+        assert ei.value.code == 2
+        out = capsys.readouterr().out
+        assert "Stopped." in out
+        assert not (tmp_path / "results").exists()
+
+    def test_main_skips_outdated_prompt_when_version_unknown(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        lists = tmp_path / "app" / "url_check_lists"
+        lists.mkdir(parents=True)
+        (lists / "list_a.txt").write_text("a.example\n", encoding="utf-8")
+        monkeypatch.setattr(run, "SKIP_CHECK", False)
+        monkeypatch.setattr(run, "RESULTS_DIR", "results")
+        monkeypatch.setattr(run, "DNS_SERVER", "")
+        monkeypatch.setattr(run, "OUTPUT_CSV", "check_results_nover.csv")
+        monkeypatch.setattr(run, "URL_CHECK_LISTS_DIR", "app/url_check_lists")
+        monkeypatch.setattr(run.os.path, "abspath", lambda p: str(tmp_path / "run.py"))
+        monkeypatch.setattr(run.os.path, "dirname", lambda p: str(tmp_path))
+        monkeypatch.setattr(
+            run, "prompt_upload_token_before_scan", lambda for_resend=False: None
+        )
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: [])
+        monkeypatch.setattr(run, "detect_location", lambda: ("", "", ""))
+        self._stub_check_domain(monkeypatch)
+        monkeypatch.setattr(run, "_read_version_text", lambda *_a: "1.2.0")
+        monkeypatch.setattr(run, "_fetch_latest_version", lambda: "")
+        monkeypatch.setattr(
+            "builtins.input",
+            mock.Mock(side_effect=AssertionError("must not ask when version unknown")),
+        )
+        run.main()
+        out = capsys.readouterr().out
+        assert "NEWER VERSION" not in out
+        assert "Continue with this old version?" not in out
+        assert (tmp_path / "results" / "check_results_nover.csv").is_file()
 
     def test_main_scan_upload_fail_keeps_csv(self, tmp_path, monkeypatch, capsys):
         lists = tmp_path / "app" / "url_check_lists"
@@ -3536,8 +4096,12 @@ def _dns_reply(query, ips=(), rcode=0, tx_id=None, question=None, extra_rr=False
         answers += b"\xc0\x0c" + struct.pack(">HHIH", 5, 1, 60, 2) + b"\xc0\x0c"
         count += 1
     for ip in ips:
-        answers += b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4)
-        answers += bytes(int(p) for p in ip.split("."))
+        if ":" in str(ip):
+            packed = socket.inet_pton(socket.AF_INET6, ip)
+            answers += b"\xc0\x0c" + struct.pack(">HHIH", 28, 1, 60, 16) + packed
+        else:
+            answers += b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4)
+            answers += bytes(int(p) for p in ip.split("."))
         count += 1
     flags = 0x8180 | (rcode & 0x0F)
     return struct.pack(">HHHHHH", tx, flags, 1, count, 0, 0) + body + answers
@@ -3558,9 +4122,10 @@ class _FakeClock:
 class _FakeTransport:
     """Scripted DNS transport: no sockets, fully deterministic."""
 
-    def __init__(self, plan=None, addresses=None):
+    def __init__(self, plan=None, addresses=None, aaaa_addresses=None):
         self.plan = plan or {}
         self.addresses = addresses or {}
+        self.aaaa_addresses = aaaa_addresses or {}
         self.default = "ok"
         self.inbox = []
         self.sent = []
@@ -3591,6 +4156,9 @@ class _FakeTransport:
             return [_dns_reply(data, rcode=5)]
         if behaviour == "noanswer":
             return [_dns_reply(data)]
+        qtype = struct.unpack(">H", data[-4:-2])[0] if len(data) >= 16 else 1
+        if qtype == dns_probe.QTYPE_AAAA:
+            return [_dns_reply(data, ips=self.aaaa_addresses.get(ip, ()))]
         return [_dns_reply(data, ips=self.addresses.get(ip, ["1.2.3.4"]))]
 
     def send(self, family, data, address):
@@ -3620,6 +4188,7 @@ def _probe(domains, resolvers, transport, **kwargs):
     kwargs.setdefault("max_seconds", 60.0)
     kwargs.setdefault("qps_by_kind", {"global": 500.0, "russian": 500.0, "nsdi": 500.0})
     kwargs.setdefault("clock", _FakeClock())
+    kwargs.setdefault("qtypes", (dns_probe.QTYPE_A,))
     return dns_probe.probe(domains, resolvers, transport=transport, **kwargs)
 
 
@@ -3701,6 +4270,11 @@ class TestDnsProbeWire:
         assert (tx, flags, qd, an, ns, ar) == (0x1234, 0x0100, 1, 0, 0, 0)
         assert packet[12:] == qname + struct.pack(">HH", 1, 1)
 
+    def test_build_query_aaaa(self):
+        qname = dns_probe.encode_qname("example.com")
+        packet = dns_probe.build_query(qname, 0x1234, qtype=dns_probe.QTYPE_AAAA)
+        assert packet[12:] == qname + struct.pack(">HH", dns_probe.QTYPE_AAAA, 1)
+
     def _query(self, domain="example.com", tx_id=0x4242):
         return dns_probe.build_query(dns_probe.encode_qname(domain), tx_id)
 
@@ -3728,6 +4302,66 @@ class TestDnsProbeWire:
         empty = dns_probe.parse_response(_dns_reply(q), 0x4242, question)
         assert nx == (3, [])
         assert empty == (0, [])
+
+    def test_parse_extracts_aaaa_and_skips_a_records(self):
+        q = dns_probe.build_query(
+            dns_probe.encode_qname("example.com"),
+            0x4242,
+            qtype=dns_probe.QTYPE_AAAA,
+        )
+        reply = _dns_reply(q, ips=["2001:db8::1", "1.2.3.4"])
+        rcode, ips = dns_probe.parse_response(
+            reply,
+            0x4242,
+            dns_probe.question_key("example.com"),
+            expected_qtype=dns_probe.QTYPE_AAAA,
+        )
+        assert rcode == 0
+        assert ips == ["2001:db8::1"]
+
+    def test_parse_aaaa_inet_ntop_error_is_skipped(self, monkeypatch):
+        monkeypatch.setattr(
+            dns_probe.socket, "inet_ntop", mock.Mock(side_effect=OSError("bad"))
+        )
+        q = dns_probe.build_query(
+            dns_probe.encode_qname("example.com"),
+            0x4242,
+            qtype=dns_probe.QTYPE_AAAA,
+        )
+        reply = _dns_reply(q, ips=["2001:db8::1"])
+        rcode, ips = dns_probe.parse_response(
+            reply,
+            0x4242,
+            dns_probe.question_key("example.com"),
+            expected_qtype=dns_probe.QTYPE_AAAA,
+        )
+        assert (rcode, ips) == (0, [])
+
+        monkeypatch.setattr(
+            dns_probe.socket,
+            "inet_ntop",
+            mock.Mock(side_effect=ValueError("bad")),
+        )
+        rcode, ips = dns_probe.parse_response(
+            reply,
+            0x4242,
+            dns_probe.question_key("example.com"),
+            expected_qtype=dns_probe.QTYPE_AAAA,
+        )
+        assert (rcode, ips) == (0, [])
+
+    def test_parse_aaaa_query_rejects_a_question(self):
+        q = self._query()
+        reply = _dns_reply(q, ips=["2001:db8::1"])
+        assert (
+            dns_probe.parse_response(
+                reply,
+                0x4242,
+                dns_probe.question_key("example.com"),
+                expected_qtype=dns_probe.QTYPE_AAAA,
+            )
+            is None
+        )
 
     def test_parse_rejects_wrong_transaction_id(self):
         q = self._query()
@@ -3786,6 +4420,48 @@ class TestDnsProbeEngine:
         assert outcomes["a"].code == dns_probe.CODE_OK
         assert outcomes["a"].ips == ("5.5.5.5",)
         assert outcomes["b"].attempts == 1
+
+    def test_aaaa_is_queried_alongside_a(self):
+        resolvers = [_mkres("a", "1.1.1.1")]
+        transport = _FakeTransport(
+            addresses={"1.1.1.1": ["5.5.5.5"]},
+            aaaa_addresses={"1.1.1.1": ["2001:db8::5"]},
+        )
+        result = _probe(
+            ["example.com"],
+            resolvers,
+            transport,
+            qtypes=(dns_probe.QTYPE_A, dns_probe.QTYPE_AAAA),
+        )
+        assert result.queries_done == 2
+        assert result.queries_total == 2
+        assert result.qtypes == (dns_probe.QTYPE_A, dns_probe.QTYPE_AAAA)
+        assert result.by_domain["example.com"]["a"].ips == ("5.5.5.5",)
+        assert result.by_domain_aaaa["example.com"]["a"].ips == ("2001:db8::5",)
+        qtypes_sent = [
+            struct.unpack(">H", pkt[-4:-2])[0] for _ip, pkt in transport.sent
+        ]
+        assert qtypes_sent == [dns_probe.QTYPE_A, dns_probe.QTYPE_AAAA]
+
+    def test_aaaa_nxdomain_does_not_change_a_outcome(self):
+        def a_ok_aaaa_nx(data):
+            qtype = struct.unpack(">H", data[-4:-2])[0]
+            if qtype == dns_probe.QTYPE_AAAA:
+                return [_dns_reply(data, rcode=3)]
+            return [_dns_reply(data, ips=["9.9.9.9"])]
+
+        resolvers = [_mkres("a", "1.1.1.1")]
+        transport = _FakeTransport(plan={"1.1.1.1": a_ok_aaaa_nx})
+        result = _probe(
+            ["blocked.test"],
+            resolvers,
+            transport,
+            qtypes=(dns_probe.QTYPE_A, dns_probe.QTYPE_AAAA),
+        )
+        assert result.by_domain["blocked.test"]["a"].code == dns_probe.CODE_OK
+        assert result.by_domain_aaaa["blocked.test"]["a"].code == (
+            dns_probe.CODE_NXDOMAIN
+        )
 
     @pytest.mark.parametrize(
         "behaviour,code",
@@ -4030,6 +4706,20 @@ class TestDnsProbeEngine:
         outcomes = result.by_domain["\u043f\u0440\u0438\u043c\u0435\u0440.\u0440\u0444"]
         assert outcomes["a"].code == dns_probe.CODE_ERROR
 
+    def test_unencodable_domain_copies_error_into_aaaa(self):
+        resolvers = [_mkres("a", "1.1.1.1")]
+        name = "\u043f\u0440\u0438\u043c\u0435\u0440.\u0440\u0444"
+        result = _probe(
+            [name],
+            resolvers,
+            _FakeTransport(),
+            qtypes=(dns_probe.QTYPE_A, dns_probe.QTYPE_AAAA),
+        )
+        assert result.by_domain[name]["a"].code == dns_probe.CODE_ERROR
+        assert result.by_domain_aaaa[name]["a"].code == dns_probe.CODE_ERROR
+        assert result.queries_done == 2
+        assert result.queries_total == 2
+
     def test_duplicate_domains_are_resolved_once(self):
         resolvers = [_mkres("a", "1.1.1.1")]
         transport = _FakeTransport()
@@ -4229,6 +4919,22 @@ class TestDnsProbeColumns:
         assert cols == dict(dns_probe.EMPTY_COLUMNS)
         assert set(cols) == set(dns_probe.COLUMNS)
 
+    def test_ipv6_suffix_is_a_parallel_column_set(self):
+        resolvers = self._resolvers()
+        outcomes = {
+            "g1": self._ok(["2001:db8::1"]),
+            "g2": dns_probe.Outcome(dns_probe.CODE_TIMEOUT, (), 3, 9.0, False),
+            "nsdi": dns_probe.Outcome(dns_probe.CODE_NXDOMAIN, (), 1, 2.0, False),
+        }
+        cols = dns_probe.format_columns(outcomes, resolvers, suffix="_ipv6")
+        assert cols["dns_probe_detail_ipv6"] == "g1=A;g2=TO;nsdi=NX"
+        assert cols["dns_probe_variants_ipv6"] == "A=2001:db8::1"
+        assert cols["dns_probe_ok_ipv6"] == "1"
+        assert cols["dns_probe_nsdi_ipv6"] == dns_probe.CODE_NXDOMAIN
+        assert "dns_probe_detail" not in cols
+        blank = dns_probe.format_columns({}, resolvers, suffix="_ipv6")
+        assert blank == dict(dns_probe.EMPTY_IPV6_COLUMNS)
+
     def test_columns_never_contain_the_csv_delimiter(self):
         resolvers = self._resolvers()
         outcomes = {
@@ -4259,6 +4965,8 @@ class TestDnsProbeMeta:
             conflicts=2,
             unmatched=1,
             stopped_early=True,
+            by_domain_aaaa={},
+            qtypes=(),
         )
         base.update(kwargs)
         return dns_probe.ProbeResult(**base)
@@ -4282,6 +4990,14 @@ class TestDnsProbeMeta:
         assert parsed["unmatched"] == "1"
         assert parsed["partial"] == "1"
         assert parsed["dead"] == "a"
+
+    def test_meta_records_qtypes(self):
+        parsed = dns_probe.parse_meta(
+            dns_probe.format_meta(
+                self._result(qtypes=(dns_probe.QTYPE_A, dns_probe.QTYPE_AAAA))
+            )
+        )
+        assert parsed["qtypes"] == "A,AAAA"
 
     def test_meta_omits_dead_when_all_resolvers_answered(self):
         assert "dead" not in dns_probe.parse_meta(
@@ -4336,7 +5052,9 @@ class TestRunDnsProbeWiring:
         rows = [{"domain": "example.com", "probe_key": "example.com"}]
         run._apply_dns_probe(rows, None)
         assert rows[0]["dns_probe_detail"] == ""
+        assert rows[0]["dns_probe_detail_ipv6"] == ""
         assert set(dns_probe.COLUMNS) <= set(rows[0])
+        assert set(dns_probe.IPV6_COLUMNS) <= set(rows[0])
 
     def test_apply_joins_rows_to_outcomes_by_punycode_key(self):
         resolvers = [_mkres("a", "1.1.1.1")]
@@ -4348,6 +5066,7 @@ class TestRunDnsProbeWiring:
         run._apply_dns_probe(rows, result)
         assert rows[0]["dns_probe_detail"] == "a=A"
         assert rows[0]["dns_probe_ok"] == "1"
+        assert rows[0]["dns_probe_detail_ipv6"] == ""
         assert rows[1]["dns_probe_detail"] == ""
 
     def test_apply_is_a_noop_without_the_module(self, monkeypatch):
@@ -4412,6 +5131,7 @@ class TestRunDnsProbeWiring:
             by_domain={}, resolvers=[_mkres("a", "1.1.1.1")], dead=("a",),
             elapsed=3.0, domains=1, queries_total=2, queries_done=1,
             conflicts=4, unmatched=0, stopped_early=True,
+            by_domain_aaaa={}, qtypes=(),
         )
         run._print_dns_probe_summary(result)
         out = capsys.readouterr().out
@@ -4432,8 +5152,14 @@ class _RecordingTransport(_FakeTransport):
     instances = []
 
     def __init__(self):
-        _FakeTransport.__init__(self, addresses={"1.1.1.1": ["10.0.0.1"],
-                                                 "9.9.9.9": ["10.0.0.1"]})
+        _FakeTransport.__init__(
+            self,
+            addresses={"1.1.1.1": ["10.0.0.1"], "9.9.9.9": ["10.0.0.1"]},
+            aaaa_addresses={
+                "1.1.1.1": ["2001:db8::1"],
+                "9.9.9.9": ["2001:db8::1"],
+            },
+        )
         self.plan = {"203.0.113.9": "drop"}
         _RecordingTransport.instances.append(self)
 
@@ -4497,7 +5223,9 @@ class TestRunDnsProbeEndToEnd:
         run.main()
         fieldnames, rows = self._read(csv_path)
 
-        for column in dns_probe.COLUMNS + dns_probe.META_COLUMNS:
+        for column in (
+            dns_probe.COLUMNS + dns_probe.IPV6_COLUMNS + dns_probe.META_COLUMNS
+        ):
             assert column in fieldnames
         assert "accessible_ipv6" in fieldnames
         assert "probe_key" not in fieldnames
@@ -4508,6 +5236,10 @@ class TestRunDnsProbeEndToEnd:
         assert row["dns_probe_ok"] == "2"
         assert row["dns_probe_total"] == "3"
         assert row["dns_probe_nsdi"] == dns_probe.CODE_OK
+        assert row["dns_probe_detail_ipv6"] == "cloudflare=A;nsdi=A;deadisp=TO"
+        assert row["dns_probe_variants_ipv6"] == "A=2001:db8::1"
+        assert row["dns_probe_ok_ipv6"] == "2"
+        assert row["dns_probe_nsdi_ipv6"] == dns_probe.CODE_OK
 
         # Run-level values ride on the first data row, like check_location.
         assert row["dns_probe_resolvers"] == (
@@ -4516,6 +5248,7 @@ class TestRunDnsProbeEndToEnd:
         meta = dns_probe.parse_meta(row["dns_probe_meta"])
         assert meta["v"] == dns_probe.META_VERSION
         assert meta["domains"] == "1"
+        assert meta["qtypes"] == "A,AAAA"
 
         out = capsys.readouterr().out
         assert "DNS probe" in out
@@ -4604,6 +5337,11 @@ class TestProbeUploadCompatibility:
                 "dns_probe_nsdi": "ok",
                 "dns_probe_detail": "cloudflare=A;nsdi=A;mts=TO",
                 "dns_probe_variants": "A=1.2.3.4",
+                "dns_probe_ok_ipv6": "1",
+                "dns_probe_total_ipv6": "3",
+                "dns_probe_nsdi_ipv6": "nxdomain",
+                "dns_probe_detail_ipv6": "cloudflare=NX;nsdi=NX;mts=TO",
+                "dns_probe_variants_ipv6": "",
                 "dns_probe_resolvers": "cloudflare=1.1.1.1/global;nsdi=195.208.4.1/nsdi",
                 "dns_probe_meta": "v=1;domains=2;elapsed=9.5;dead=mts",
             }
@@ -4655,6 +5393,9 @@ class TestProbeUploadCompatibility:
         # Per-domain probe values do travel.
         assert payload["result_data"]["domains"][0]["dns_probe_detail"] == (
             "cloudflare=A;nsdi=A;mts=TO"
+        )
+        assert payload["result_data"]["domains"][0]["dns_probe_detail_ipv6"] == (
+            "cloudflare=NX;nsdi=NX;mts=TO"
         )
 
     def test_adding_probe_columns_does_not_disturb_the_old_payload_shape(
@@ -5175,6 +5916,7 @@ def _make_prober(transport=None, domains=None, resolvers=None, **kwargs):
     kwargs.setdefault("stop_event", None)
     kwargs.setdefault("progress", None)
     kwargs.setdefault("clock", _FakeClock())
+    kwargs.setdefault("qtypes", (dns_probe.QTYPE_A,))
     return dns_probe._Prober(
         domains=domains or ["example.com"],
         resolvers=resolvers or [_mkres("a", "1.1.1.1")],
@@ -5356,7 +6098,7 @@ class TestDnsProbeRemainingBranches:
     def test_settle_is_idempotent_and_finalize_ignores_stale_indexes(self):
         prober = _make_prober()
         pending = dns_probe._Pending("example.com", b"\x00", b"", 0, 0.0)
-        prober.active[(0, "example.com")] = pending
+        prober.active[(0, "example.com", dns_probe.QTYPE_A)] = pending
         prober.inflight_n[0] = 1
         prober._settle(pending, dns_probe.CODE_OK, ("1.1.1.1",), 1.0)
         prober._settle(pending, dns_probe.CODE_TIMEOUT, (), 2.0)

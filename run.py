@@ -146,6 +146,7 @@ IPV6_CHECK_COLUMNS = (
     "dns_resolved_ips_ipv6",
     "dns_time_ms_ipv6",
     "dns_error_ipv6",
+    "dns_rcode_ipv6",
     "tcp_connect_time_ms_ipv6",
     "ssl_valid_ipv6",
     "ssl_issuer_ipv6",
@@ -170,6 +171,7 @@ RESULT_CSV_BASE_COLUMNS = (
     "dns_resolved_ips",
     "dns_time_ms",
     "dns_error",
+    "dns_rcode",
     "tcp_connect_time_ms",
     "ssl_valid",
     "ssl_issuer",
@@ -202,6 +204,7 @@ def result_csv_fieldnames(include_dns_probe=True):
     names = list(RESULT_CSV_BASE_COLUMNS)
     if include_dns_probe and dns_probe is not None:
         names.extend(dns_probe.COLUMNS)
+        names.extend(getattr(dns_probe, "IPV6_COLUMNS", ()))
         names.extend(dns_probe.META_COLUMNS)
     return names
 
@@ -778,6 +781,29 @@ def _print_update_notice(local, remote):
     print()
 
 
+def _prompt_continue_if_outdated(local, remote):
+    """Stop until the volunteer answers. Empty / n / EOF aborts.
+
+    If the version check got nothing (GitHub/CDNs blocked), skip this.
+    """
+    if not remote or not _is_remote_newer(local, remote):
+        return True
+    print("Get the new version from Helpdesk if you can.")
+    print("Continue with this old version? [y/N]: ", end="")
+    sys.stdout.flush()
+    try:
+        raw = input()
+    except EOFError:
+        raw = ""
+    answer = (raw or "").strip().lower()
+    if answer in ("y", "yes"):
+        print()
+        return True
+    print("Stopped. Get the new version from Na Svyazi Helpdesk (nasvyazi.org)")
+    print("or https://github.com/RunetMonitor/SONAR")
+    return False
+
+
 def _print_version_block(local, remote):
     print("Version: {}".format(local if local else "-"))
     _print_update_notice(local, remote)
@@ -877,6 +903,60 @@ def _probe_family(row, domain, family, suffix, ips):
             row["accessible_ipv6"] = "NO"
 
 
+def query_local_dns(domain, qtype=QTYPE_A, server=None, timeout=None):
+    """Raw UDP to the volunteer resolver. Returns (code, ips).
+
+    ``getaddrinfo`` / OS stub lookup stays the reachability path. This
+    query keeps the DNS rcode (NXDOMAIN vs SERVFAIL vs timeout vs fake A)
+    that libc otherwise squashes into EAI_NONAME.
+    """
+    if timeout is None:
+        timeout = DNS_TIMEOUT
+    if dns_probe is None:
+        return "", []
+    if server:
+        servers = [server]
+    else:
+        servers = get_system_dns_servers()
+    last = ("", [])
+    saw_server = False
+    for ns in servers:
+        ns = (ns or "").strip()
+        if not ns:
+            continue
+        saw_server = True
+        try:
+            code, ips = dns_probe.query_nameserver(
+                domain, ns, timeout, qtype=qtype
+            )
+        except Exception:
+            last = (dns_probe.CODE_ERROR, [])
+            continue
+        last = (code, list(ips) if ips else [])
+        if code not in (dns_probe.CODE_TIMEOUT, dns_probe.CODE_ERROR):
+            return last
+    if not saw_server:
+        return "", []
+    return last
+
+
+def _record_local_dns_rcode(row, domain, server, family, suffix):
+    """Store volunteer-resolver rcode; keep fake A/AAAA if getaddrinfo failed."""
+    qtype = QTYPE_AAAA if family == socket.AF_INET6 else QTYPE_A
+    code, udp_ips = "", []
+    try:
+        code, udp_ips = query_local_dns(domain, qtype=qtype, server=server)
+    except Exception:
+        code, udp_ips = "", []
+    row[_col("dns_rcode", suffix)] = code or ""
+    key = _col("dns_resolved_ips", suffix)
+    if row.get(key):
+        return
+    usable = _ips_of_family(udp_ips, family)
+    if usable:
+        row[key] = "; ".join(usable)
+
+
 def check_domain(domain, source_file, server=None, original=None):
     row = {
         "domain": original if original is not None else domain,
@@ -885,6 +965,7 @@ def check_domain(domain, source_file, server=None, original=None):
         "dns_resolved_ips": "",
         "dns_time_ms": "",
         "dns_error": "",
+        "dns_rcode": "",
         "tcp_connect_time_ms": "",
         "ssl_valid": "",
         "ssl_issuer": "",
@@ -912,10 +993,14 @@ def check_domain(domain, source_file, server=None, original=None):
         row["accessible"] = "NO"
     else:
         _probe_family(row, domain, socket.AF_INET, "", ips_v4)
+    _record_local_dns_rcode(row, domain, server, socket.AF_INET, "")
 
     if not _host_has_ipv6():
         row["dns_error_ipv6"] = "host has no IPv6"
         row["http_error_ipv6"] = "skipped (no IPv6)"
+        _record_local_dns_rcode(
+            row, domain, server, socket.AF_INET6, IPV6_FIELD_SUFFIX
+        )
         return row
 
     ips_v6, dns_ms_v6, dns_err_v6 = _resolve_family(
@@ -925,8 +1010,14 @@ def check_domain(domain, source_file, server=None, original=None):
     if dns_err_v6:
         row["dns_error_ipv6"] = dns_err_v6
         row["http_error_ipv6"] = "skipped (DNS failed)"
+        _record_local_dns_rcode(
+            row, domain, server, socket.AF_INET6, IPV6_FIELD_SUFFIX
+        )
         return row
     _probe_family(row, domain, socket.AF_INET6, IPV6_FIELD_SUFFIX, ips_v6)
+    _record_local_dns_rcode(
+        row, domain, server, socket.AF_INET6, IPV6_FIELD_SUFFIX
+    )
     return row
 
 _TRANSLIT_MAP = {
@@ -1405,17 +1496,27 @@ def _apply_dns_probe(results, probe_result):
     if dns_probe is None:
         return
     blank = dict(dns_probe.EMPTY_COLUMNS)
+    blank.update(getattr(dns_probe, "EMPTY_IPV6_COLUMNS", {}))
     if probe_result is None:
         for row in results:
             row.update(blank)
         return
     resolvers = probe_result.resolvers
+    aaaa_by_domain = getattr(probe_result, "by_domain_aaaa", {}) or {}
     for row in results:
-        outcomes = probe_result.by_domain.get(row.get("probe_key", ""))
+        key = row.get("probe_key", "")
+        outcomes = probe_result.by_domain.get(key)
         if outcomes:
             row.update(dns_probe.format_columns(outcomes, resolvers))
         else:
-            row.update(blank)
+            row.update(dns_probe.EMPTY_COLUMNS)
+        aaaa = aaaa_by_domain.get(key)
+        if aaaa:
+            row.update(
+                dns_probe.format_columns(aaaa, resolvers, suffix="_ipv6")
+            )
+        else:
+            row.update(getattr(dns_probe, "EMPTY_IPV6_COLUMNS", {}))
 
 
 def _print_dns_probe_summary(probe_result):
@@ -1476,6 +1577,9 @@ def main():
     ver = _read_version_text(script_dir)
     remote = _fetch_latest_version()
     _print_version_block(ver, remote)
+    if remote and not _prompt_continue_if_outdated(ver, remote):
+        pause_if_windows()
+        sys.exit(2)
     print()
 
     if SKIP_CHECK:
