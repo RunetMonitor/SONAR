@@ -28,6 +28,7 @@ if str(APP) not in sys.path:
 import banner  # noqa: E402
 import config  # noqa: E402
 import dns_probe  # noqa: E402
+import require_runtime  # noqa: E402
 import run  # noqa: E402
 import upload_token  # noqa: E402
 
@@ -98,6 +99,110 @@ class TestConfig:
         text = example.read_text(encoding="utf-8")
         assert "Volunteers" in text or "volunteers" in text
         assert "config.local.py" in text
+
+
+class TestRequireRuntime:
+    def test_current_python_passes(self):
+        assert require_runtime.MIN_PY == (3, 7)
+        require_runtime.require_runtime()
+
+    def test_python37_is_accepted(self, monkeypatch):
+        monkeypatch.setattr(
+            require_runtime.sys, "version_info", (3, 7, 0, "final", 0)
+        )
+        require_runtime.require_python()
+
+    def test_module_stays_parseable_on_python36(self):
+        src = (APP / "require_runtime.py").read_text(encoding="utf-8")
+        assert "from __future__ import annotations" not in src
+        compile(src, "require_runtime.py", "exec")
+
+    def test_run_py_checks_before_config_import(self):
+        src = (ROOT / "run.py").read_text(encoding="utf-8")
+        assert src.index("require_runtime") < src.index("from config import")
+
+    def test_send_results_checks_before_config_import(self):
+        src = (APP / "send_results.py").read_text(encoding="utf-8")
+        assert "from __future__ import annotations" not in src
+        assert src.index("require_runtime") < src.index("from config import")
+
+    def test_old_python_exits(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            require_runtime.sys, "version_info", (3, 6, 15, "final", 0)
+        )
+        monkeypatch.setattr(require_runtime, "_pause_if_windows", lambda: None)
+        with pytest.raises(SystemExit) as ei:
+            require_runtime.require_python()
+        assert ei.value.code == 2
+        out = capsys.readouterr().out
+        assert "3.7" in out
+        assert "3.6.15" in out
+
+    def test_missing_stdlib_exits(self, monkeypatch, capsys):
+        real_import = __import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "zipfile" or name.startswith("zipfile."):
+                raise ImportError("hidden")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr("builtins.__import__", fake_import)
+        monkeypatch.setattr(require_runtime, "_pause_if_windows", lambda: None)
+        with pytest.raises(SystemExit) as ei:
+            require_runtime.require_stdlib()
+        assert ei.value.code == 2
+        assert "zipfile" in capsys.readouterr().out
+
+    def test_scan_ready_ok(self, tmp_path):
+        lists = tmp_path / "app" / "url_check_lists"
+        lists.mkdir(parents=True)
+        (lists / "list_a.txt").write_text("a.example\n", encoding="utf-8")
+        files = run._require_scan_ready(str(tmp_path))
+        assert files
+        assert (tmp_path / "results").is_dir()
+        assert not (tmp_path / "results" / ".sonar_write_check").exists()
+
+    def test_scan_ready_no_lists(self, tmp_path, monkeypatch, capsys):
+        (tmp_path / "app" / "url_check_lists").mkdir(parents=True)
+        monkeypatch.setattr(run, "pause_if_windows", lambda: None)
+        with pytest.raises(SystemExit) as ei:
+            run._require_scan_ready(str(tmp_path))
+        assert ei.value.code == 1
+        assert "list_" in capsys.readouterr().out
+
+    def test_scan_ready_write_fail(self, tmp_path, monkeypatch):
+        lists = tmp_path / "app" / "url_check_lists"
+        lists.mkdir(parents=True)
+        (lists / "list_a.txt").write_text("a.example\n", encoding="utf-8")
+        monkeypatch.setattr(run, "RESULTS_DIR", "results")
+        monkeypatch.setattr(run, "pause_if_windows", lambda: None)
+        monkeypatch.setattr(
+            run.os, "makedirs", mock.Mock(side_effect=OSError("readonly"))
+        )
+        with pytest.raises(SystemExit) as ei:
+            run._require_scan_ready(str(tmp_path))
+        assert ei.value.code == 1
+
+    def test_pause_on_windows(self, monkeypatch):
+        monkeypatch.setattr(require_runtime.sys, "platform", "win32")
+        monkeypatch.setattr("builtins.input", lambda *_a, **_k: "")
+        require_runtime._pause_if_windows()
+
+    def test_pause_on_windows_eof(self, monkeypatch):
+        monkeypatch.setattr(require_runtime.sys, "platform", "win32")
+
+        def boom(*_a, **_k):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", boom)
+        require_runtime._pause_if_windows()
+
+    def test_pause_skipped_off_windows(self, monkeypatch):
+        monkeypatch.setattr(require_runtime.sys, "platform", "linux")
+        called = []
+        monkeypatch.setattr("builtins.input", lambda *_a, **_k: called.append(1))
+        require_runtime._pause_if_windows()
+        assert called == []
 
 
 class TestBanner:
@@ -743,10 +848,18 @@ class TestSendResultsCryptoAndZip:
         token = upload_token.SHARED_VALID_TOKEN
         zbytes = sr._payload_zip_bytes(payload, token)
         assert zbytes[:4] == b"PK\x03\x04"
+        # Local-file header general-purpose bit 0 = encrypted (ZIP APPNOTE).
+        flags = struct.unpack_from("<H", zbytes, 6)[0]
+        assert flags & sr._ZIP_FLAG_ENCRYPTED
         with zipfile.ZipFile(io.BytesIO(zbytes)) as zf:
             zf.setpassword(token.encode("utf-8"))
             data = zf.read("payload.json")
         assert json.loads(data.decode("utf-8")) == payload
+
+    def test_payload_zip_does_not_use_cpython_private_mask(self):
+        src = (APP / "send_results.py").read_text(encoding="utf-8")
+        assert "flag_bits = zipfile._MASK_ENCRYPTED" not in src
+        assert sr._ZIP_FLAG_ENCRYPTED == 0x0001
 
     def test_multipart_body(self):
         body, ct = sr._zip_multipart_body(b"ZIPDATA", "out.zip")
@@ -1229,6 +1342,22 @@ class TestReadmeVolunteerWording:
         assert config.TOKEN_SOURCE_TEXT.split("(")[0].strip() in readme or (
             "Na Svyazi Helpdesk" in readme
         )
+        assert "Python 3.7 or newer" in readme
+        assert "3.6" not in readme
+
+
+class TestLaunchersPythonRequirement:
+    def test_run_sh_rejects_old_python(self):
+        text = (ROOT / "run.sh").read_text(encoding="utf-8")
+        assert "Python 3.7+" in text or "Python 3.7 or newer" in text
+        assert "sys.version_info >= (3, 7)" in text
+        assert "3.6" not in text
+
+    def test_run_bat_rejects_old_python(self):
+        text = (ROOT / "run.bat").read_text(encoding="utf-8")
+        assert "Python 3.7+" in text or "Python 3.7 or newer" in text
+        assert "sys.version_info >= (3, 7)" in text
+        assert "3.6" not in text
 
 
 class TestUploadTokenExtraBranches:
@@ -2032,7 +2161,9 @@ class TestRunMainFlows:
         monkeypatch.setattr(run.os.path, "abspath", lambda p: str(tmp_path / "run.py"))
         monkeypatch.setattr(run.os.path, "dirname", lambda p: str(tmp_path))
         monkeypatch.setattr(
-            run, "prompt_upload_token_before_scan", lambda for_resend=False: None
+            run,
+            "prompt_upload_token_before_scan",
+            mock.Mock(side_effect=AssertionError("token prompt must not run")),
         )
         monkeypatch.setattr(run, "get_system_dns_servers", lambda: [])
         monkeypatch.setattr(run, "detect_location", lambda: ("", "", ""))

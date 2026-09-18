@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ask several DNS resolvers about the same domains (stdlib, Python 3.6+)."""
+"""Ask several DNS resolvers about the same domains (stdlib, Python 3.7+)."""
 
 import collections
 import random
