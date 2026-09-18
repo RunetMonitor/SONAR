@@ -5,3 +5,4 @@ source .venv/bin/activate
 .venv/bin/python -m coverage run -m pytest test_app.py -q
 .venv/bin/python -m coverage report -m --omit='config.local.py,test_*.py'
 deactivate
+cd ..

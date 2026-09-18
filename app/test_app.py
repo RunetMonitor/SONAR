@@ -523,7 +523,7 @@ class TestVersionCheck:
         assert "A NEWER VERSION OF THIS SCRIPT IS AVAILABLE (1.3.0). YOU HAVE 1.2.0." in out
         assert out.strip() == out.strip().upper()
         assert "NASVYAZI.ORG" in out
-        assert "GITHUB.COM/RUNETMONITOR/SONAR" in out
+        assert "GET IT FROM GITHUB OR HELPDESK" in out
 
     def test_notice_silent_when_same_or_older_or_missing(self, capsys):
         run._print_update_notice("1.3.0", "1.3.0")
@@ -546,6 +546,8 @@ class TestVersionCheck:
         monkeypatch.setattr("builtins.input", lambda *_a: "Y")
         assert run._prompt_continue_if_outdated("1.2.0", "1.3.0") is True
         out = capsys.readouterr().out
+        assert "Get the new version from GitHub or Helpdesk." in out
+        assert "\nhttps://github.com/RunetMonitor/SONAR/archive/refs/heads/main.zip\n" in out
         assert "Continue with this old version?" in out
         assert "[y/N]" in out
 
@@ -562,6 +564,8 @@ class TestVersionCheck:
         assert run._prompt_continue_if_outdated("1.2.0", "1.3.0") is False
         out = capsys.readouterr().out
         assert "Stopped." in out
+        assert "https://github.com/RunetMonitor/SONAR/archive/refs/heads/main.zip" in out
+        assert "Helpdesk" in out
 
     def test_outdated_prompt_eof_stops(self, monkeypatch):
         def _eof(*_a):
@@ -4056,6 +4060,9 @@ class TestBootstrapAndEntrypoints:
         monkeypatch.setattr(config, "SKIP_CHECK", True)
         monkeypatch.setattr(config, "OUTPUT_CSV", "missing_for_coverage.csv")
         monkeypatch.setattr(config, "RESULTS_DIR", str(tmp_path / "results"))
+        # Fresh run.py copies VERSION_CHECK_URLS at import. Empty it so a live
+        # GitHub version cannot abort (exit 2) before SKIP_CHECK missing CSV.
+        monkeypatch.setattr(config, "VERSION_CHECK_URLS", ())
         (tmp_path / "results").mkdir()
         monkeypatch.setattr("builtins.input", lambda *_a, **_k: "")
 

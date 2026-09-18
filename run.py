@@ -774,10 +774,7 @@ def _print_update_notice(local, remote):
             remote, local
         )
     )
-    print(
-        "ASK NASVYAZI HELPDESK (NASVYAZI.ORG) OR SEE "
-        "GITHUB.COM/RUNETMONITOR/SONAR"
-    )
+    print("GET IT FROM GITHUB OR HELPDESK (NASVYAZI.ORG)")
     print()
 
 
@@ -788,7 +785,10 @@ def _prompt_continue_if_outdated(local, remote):
     """
     if not remote or not _is_remote_newer(local, remote):
         return True
-    print("Get the new version from Helpdesk if you can.")
+    print("Get the new version from GitHub or Helpdesk.")
+    print()
+    print("https://github.com/RunetMonitor/SONAR/archive/refs/heads/main.zip")
+    print()
     print("Continue with this old version? [y/N]: ", end="")
     sys.stdout.flush()
     try:
@@ -799,8 +799,9 @@ def _prompt_continue_if_outdated(local, remote):
     if answer in ("y", "yes"):
         print()
         return True
-    print("Stopped. Get the new version from Na Svyazi Helpdesk (nasvyazi.org)")
-    print("or https://github.com/RunetMonitor/SONAR")
+    print("Stopped. Get the new version from GitHub or Helpdesk.")
+    print()
+    print("https://github.com/RunetMonitor/SONAR/archive/refs/heads/main.zip")
     return False
 
 
