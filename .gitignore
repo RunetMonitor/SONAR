@@ -13,3 +13,6 @@ app/config.local.py
 app/.env
 app/.coverage
 .coverage
+# Anonymous install id + HMAC of public IP — never commit or send
+.sonar
+.sonar.tmp

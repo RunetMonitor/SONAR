@@ -122,6 +122,7 @@ class TestRequireRuntime:
     def test_run_py_checks_before_config_import(self):
         src = (ROOT / "run.py").read_text(encoding="utf-8")
         assert src.index("require_runtime") < src.index("from config import")
+        compile(src, "run.py", "exec")
 
     def test_send_results_checks_before_config_import(self):
         src = (APP / "send_results.py").read_text(encoding="utf-8")
@@ -1808,6 +1809,7 @@ class TestSendResultsPayload:
         assert "1.1.1.1" not in payload["region"]
         assert payload["provider"] == "ISP"
         assert "ip_address" not in payload
+        assert payload.get("sonar_id", "") == ""
         assert payload["version"] == "1.0.0"
         assert payload["file_name"] == "check_results_x.csv"
         domains = payload["result_data"]["domains"]
@@ -2225,6 +2227,7 @@ class TestCsvNoIpPersistence:
         """Simulate the CSV write path fieldnames used by run.main."""
         fieldnames = run.result_csv_fieldnames(include_dns_probe=False)
         assert "check_ip_address" not in fieldnames
+        assert "sonar_id" in fieldnames
         assert "accessible" in fieldnames
         assert "accessible_ipv6" in fieldnames
         assert fieldnames.index("accessible") < fieldnames.index("accessible_ipv6")
@@ -2248,6 +2251,168 @@ class TestCsvNoIpPersistence:
         assert "accessible_ipv6" in text
 
 
+class TestSonarId:
+    def test_creates_file_and_keeps_id_for_same_ip(self, tmp_path):
+        first = run.resolve_sonar_id(str(tmp_path), "203.0.113.10")
+        second = run.resolve_sonar_id(str(tmp_path), "203.0.113.10")
+        assert first == second
+        assert len(first) == 64
+        int(first, 16)
+        stored = (tmp_path / ".sonar").read_text(encoding="utf-8").strip().split()
+        assert stored[0] == first
+        assert stored[1] == run._hmac_public_ip(first, "203.0.113.10")
+        assert "203.0.113.10" not in (tmp_path / ".sonar").read_text(encoding="utf-8")
+
+    def test_rotates_when_public_ip_changes(self, tmp_path):
+        first = run.resolve_sonar_id(str(tmp_path), "203.0.113.10")
+        second = run.resolve_sonar_id(str(tmp_path), "198.51.100.20")
+        assert first != second
+        stored = (tmp_path / ".sonar").read_text(encoding="utf-8").strip().split()
+        assert stored[0] == second
+        assert stored[1] == run._hmac_public_ip(second, "198.51.100.20")
+
+    def test_missing_ip_keeps_existing_id(self, tmp_path):
+        first = run.resolve_sonar_id(str(tmp_path), "203.0.113.10")
+        second = run.resolve_sonar_id(str(tmp_path), "")
+        assert first == second
+
+    def test_binds_hmac_without_rotating_if_file_had_id_only(self, tmp_path):
+        sonar_id = "ab" * 32
+        (tmp_path / ".sonar").write_text(sonar_id + "\n", encoding="utf-8")
+        got = run.resolve_sonar_id(str(tmp_path), "203.0.113.10")
+        assert got == sonar_id
+        stored = (tmp_path / ".sonar").read_text(encoding="utf-8").strip().split()
+        assert stored[0] == sonar_id
+        assert stored[1] == run._hmac_public_ip(sonar_id, "203.0.113.10")
+
+    def test_corrupt_file_is_replaced(self, tmp_path):
+        (tmp_path / ".sonar").write_text("not-valid\n", encoding="utf-8")
+        got = run.resolve_sonar_id(str(tmp_path), "203.0.113.10")
+        assert len(got) == 64
+        int(got, 16)
+
+    def test_payload_lifts_sonar_id_from_old_or_new_csv(self, monkeypatch):
+        monkeypatch.setattr(sr, "get_dns_servers", lambda: [])
+        old_rows = [
+            {
+                "domain": "example.com",
+                "accessible": "YES",
+                "check_location": "City",
+                "check_provider": "ISP",
+                "check_version": "1.2.0",
+            }
+        ]
+        old_payload = sr._build_payload(old_rows, Path("check_results_old.csv"))
+        assert old_payload["sonar_id"] == ""
+        assert "sonar_id" not in old_payload["result_data"]["domains"][0]
+
+        new_id = "cd" * 32
+        new_rows = [
+            {
+                "domain": "example.com",
+                "accessible": "YES",
+                "sonar_id": new_id,
+            },
+            {
+                "domain": "other.test",
+                "accessible": "NO",
+                "sonar_id": new_id,
+            },
+        ]
+        new_payload = sr._build_payload(new_rows, Path("check_results_new.csv"))
+        assert new_payload["sonar_id"] == new_id
+        for entry in new_payload["result_data"]["domains"]:
+            assert "sonar_id" not in entry
+
+    def test_gitignore_excludes_sonar_file(self):
+        text = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        assert ".sonar" in text
+
+    def test_is_hex_string_rejects_non_hex_of_right_length(self):
+        assert run._is_hex_string("g" * 64, 64) is False
+        assert run._is_hex_string("", 64) is False
+        assert run._is_hex_string("ab", 64) is False
+
+    def test_hex_eq_rejects_bad_types_and_lengths(self):
+        assert run._hex_eq(None, "aa") is False
+        assert run._hex_eq("aa", None) is False
+        assert run._hex_eq("aa", "aabb") is False
+        assert run._hex_eq("aa", "aa") is True
+
+    def test_hex_eq_swallows_compare_digest_errors(self, monkeypatch):
+        monkeypatch.setattr(
+            run.hmac, "compare_digest", mock.Mock(side_effect=ValueError("boom"))
+        )
+        assert run._hex_eq("aa", "aa") is False
+
+    def test_empty_sonar_file_is_replaced(self, tmp_path):
+        (tmp_path / ".sonar").write_text("\n", encoding="utf-8")
+        got = run.resolve_sonar_id(str(tmp_path), "203.0.113.10")
+        assert len(got) == 64
+
+    def test_invalid_stored_hmac_is_rebound_without_rotating(self, tmp_path):
+        sonar_id = "ab" * 32
+        (tmp_path / ".sonar").write_text(sonar_id + " not-a-hmac\n", encoding="utf-8")
+        got = run.resolve_sonar_id(str(tmp_path), "203.0.113.10")
+        assert got == sonar_id
+        stored = (tmp_path / ".sonar").read_text(encoding="utf-8").strip().split()
+        assert stored[1] == run._hmac_public_ip(sonar_id, "203.0.113.10")
+
+    def test_non_hex_id_of_correct_length_is_replaced(self, tmp_path):
+        (tmp_path / ".sonar").write_text(("g" * 64) + "\n", encoding="utf-8")
+        got = run.resolve_sonar_id(str(tmp_path), "203.0.113.10")
+        assert got != "g" * 64
+        int(got, 16)
+
+    def test_first_run_without_public_ip_writes_id_only(self, tmp_path):
+        got = run.resolve_sonar_id(str(tmp_path), "")
+        line = (tmp_path / ".sonar").read_text(encoding="utf-8").strip()
+        assert line == got
+        assert " " not in line
+
+    def test_chmod_errors_are_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            run.os, "chmod", mock.Mock(side_effect=OSError("no chmod"))
+        )
+        got = run.resolve_sonar_id(str(tmp_path), "203.0.113.10")
+        assert len(got) == 64
+        assert (tmp_path / ".sonar").is_file()
+
+    def test_write_cleans_tmp_when_replace_fails(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            run.os, "replace", mock.Mock(side_effect=OSError("replace failed"))
+        )
+        with pytest.raises(OSError, match="replace failed"):
+            run._write_sonar_file(str(tmp_path / ".sonar"), "ab" * 32, "cd" * 32)
+        assert not (tmp_path / ".sonar.tmp").exists()
+
+    def test_write_unlink_tmp_failure_still_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            run.os, "replace", mock.Mock(side_effect=OSError("replace failed"))
+        )
+        monkeypatch.setattr(
+            run.os, "unlink", mock.Mock(side_effect=OSError("unlink failed"))
+        )
+        with pytest.raises(OSError, match="replace failed"):
+            run._write_sonar_file(str(tmp_path / ".sonar"), "ab" * 32, "cd" * 32)
+
+    def test_bind_write_failure_keeps_id(self, tmp_path, monkeypatch):
+        sonar_id = "ab" * 32
+        (tmp_path / ".sonar").write_text(sonar_id + "\n", encoding="utf-8")
+        monkeypatch.setattr(
+            run, "_write_sonar_file", mock.Mock(side_effect=OSError("disk full"))
+        )
+        assert run.resolve_sonar_id(str(tmp_path), "203.0.113.10") == sonar_id
+
+    def test_create_write_failure_still_returns_id(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            run, "_write_sonar_file", mock.Mock(side_effect=OSError("disk full"))
+        )
+        got = run.resolve_sonar_id(str(tmp_path), "203.0.113.10")
+        assert len(got) == 64
+        int(got, 16)
+
+
 class TestReadmeVolunteerWording:
     def test_readme_matches_token_source(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -2259,6 +2424,7 @@ class TestReadmeVolunteerWording:
         assert "nasvyazi.org" in readme
         assert "one-time" in readme.lower() or "one-time" in readme
         assert "Do not edit config.py" in readme or "do not edit config" in readme.lower()
+        assert ".sonar" in readme
         assert "unencrypted CSV" in readme
         assert "re-send" in readme.lower() or "Re-send" in readme
         assert config.TOKEN_SOURCE_TEXT.split("(")[0].strip() in readme or (
@@ -3149,6 +3315,18 @@ class TestRunMainFlows:
         assert "check_ip_address" not in text
         assert "City, Country" in text
         assert "accessible_ipv6" in text.splitlines()[0]
+        assert "sonar_id" in text.splitlines()[0]
+        rows = list(csv.DictReader(io.StringIO(text)))
+        sonar_id = rows[0]["sonar_id"]
+        assert len(sonar_id) == 64
+        int(sonar_id, 16)
+        for row in rows:
+            assert row["sonar_id"] == sonar_id
+        sonar_path = tmp_path / ".sonar"
+        assert sonar_path.is_file()
+        stored = sonar_path.read_text(encoding="utf-8").strip().split()
+        assert stored[0] == sonar_id
+        assert stored[1] not in text
         assert "this computer has no IPv6" in out
 
     def test_update_notice_at_start_and_end(self, tmp_path, monkeypatch, capsys):
@@ -4450,6 +4628,7 @@ class TestProbeUploadCompatibility:
         assert payload["total"] == 2
         assert payload["accessible"] == 1
         assert payload["region"] == "City, RU"
+        assert payload.get("sonar_id", "") == ""
         names = [d["name"] for d in payload["result_data"]["domains"]]
         assert names == ["example.com", "blocked.test"]
 
@@ -4472,6 +4651,7 @@ class TestProbeUploadCompatibility:
             assert "dns_probe_resolvers" not in entry
             assert "dns_probe_meta" not in entry
             assert "probe_key" not in entry
+            assert "sonar_id" not in entry
         # Per-domain probe values do travel.
         assert payload["result_data"]["domains"][0]["dns_probe_detail"] == (
             "cloudflare=A;nsdi=A;mts=TO"

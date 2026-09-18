@@ -90,6 +90,7 @@ _EXCLUDED = {
     "check_provider",
     "check_ip_address",
     "check_version",
+    "sonar_id",
     "probe_key",
 }
 _EXCLUDED.update(PROBE_META_COLUMNS)
@@ -424,7 +425,15 @@ def _build_payload(rows: List[Dict[str, Any]], csv_path: Path) -> Dict[str, Any]
     if ipv6_summary:
         result_data["ipv6"] = ipv6_summary
 
+    sonar_id = ""
+    for row in rows:
+        value = (row.get("sonar_id") or "").strip()
+        if value:
+            sonar_id = value
+            break
+
     # Omit end-user ip_address from upload. Region is sanitized (no public IP suffix).
+    # sonar_id is optional so older volunteer CSVs still upload.
     return {
         "result_data": result_data,
         "dns_servers": get_dns_servers(),
@@ -437,6 +446,7 @@ def _build_payload(rows: List[Dict[str, Any]], csv_path: Path) -> Dict[str, Any]
         "total": len(rows),
         "version": first.get("check_version", ""),
         "file_name": csv_path.name,
+        "sonar_id": sonar_id,
     }
 
 
