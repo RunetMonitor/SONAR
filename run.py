@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from banner import print_banner
+from banner import bold, print_banner
 from config import (
     CHECK_LIMIT_N,
     DNS_PROBE_ATTEMPTS,
@@ -80,7 +80,8 @@ def prompt_upload_token_before_scan(for_resend=False):
       str   - validated token: scan then upload (or upload only on re-send)
     Exits the process on bad format (after Windows pause).
     """
-    print("Important: run without VPN so the path matches a normal user.")
+    print(bold("Important:") + " run without VPN so the path matches a normal user.")
+    print(bold("Important:") + " use a network cable from your ISP, not a mobile hotspot.")
     print()
     print(TOKEN_SOURCE_TEXT)
     if for_resend:
@@ -270,8 +271,13 @@ def resolve_dns_custom(domain, server, timeout, qtype=QTYPE_A):
         sock.close()
 
 def resolve_dns_system(domain, timeout, family=socket.AF_INET):
-    infos = socket.getaddrinfo(domain, None, family, socket.SOCK_STREAM)
-    return list({info[4][0] for info in infos})
+    if family == socket.AF_INET6:
+        dns_ips = _aaaa_from_system_dns(domain, timeout)
+        if dns_ips:
+            return dns_ips
+    infos = _family_addrinfo(domain, None, family)
+    ips = list(dict.fromkeys(_sockaddr_ip(info[4]) for info in infos))
+    return _ips_of_family(ips, family)
 
 def resolve_dns(domain, server=None, timeout=DNS_TIMEOUT, family=socket.AF_INET):
     if server:
@@ -285,8 +291,43 @@ def resolve_dns(domain, server=None, timeout=DNS_TIMEOUT, family=socket.AF_INET)
 def _host_has_ipv6():
     return bool(getattr(socket, "has_ipv6", False))
 
+def _ipv6_packed(ip):
+    try:
+        return socket.inet_pton(socket.AF_INET6, ip)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+def _is_ipv4_addr(ip):
+    try:
+        socket.inet_pton(socket.AF_INET, ip)
+        return True
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+
+def _is_ipv4_mapped_ipv6(ip):
+    """True for ::ffff:a.b.c.d (IPv4 synthesized as IPv6)."""
+    packed = _ipv6_packed(ip)
+    if packed is None:
+        return False
+    return packed[:12] == b"\x00" * 10 + b"\xff\xff"
+
+def _is_usable_ipv6(ip):
+    """Global IPv6 only: not mapped IPv4, loopback, link-local, or multicast."""
+    packed = _ipv6_packed(ip)
+    if packed is None:
+        return False
+    if packed[:12] == b"\x00" * 10 + b"\xff\xff":
+        return False
+    if packed == b"\x00" * 16 or packed == b"\x00" * 15 + b"\x01":
+        return False
+    if packed[0] == 0xFF:
+        return False
+    if packed[0] == 0xFE and (packed[1] & 0xC0) == 0x80:
+        return False
+    return True
+
 def _is_ipv6_addr(ip):
-    return ":" in (ip or "")
+    return _is_usable_ipv6(ip)
 
 def _ips_of_family(ips, family):
     out = []
@@ -294,20 +335,118 @@ def _ips_of_family(ips, family):
         if not ip:
             continue
         if family == socket.AF_INET6:
-            if _is_ipv6_addr(ip):
+            if _is_usable_ipv6(ip):
                 out.append(ip)
-        elif not _is_ipv6_addr(ip):
+        elif _is_ipv4_addr(ip):
             out.append(ip)
     return out
 
+
+def _sockaddr_ip(sockaddr):
+    if not sockaddr:
+        return ""
+    return sockaddr[0] or ""
+
+
+def _gai_flag_sets(family):
+    """Flag sets for getaddrinfo. macOS flags=0 can hide AAAA behind ::ffff:."""
+    if family != socket.AF_INET6:
+        return (0,)
+    extra = getattr(socket, "AI_ALL", 0) or 0
+    if extra:
+        return (extra, 0)
+    return (0,)
+
+
+def _family_addrinfo(host, port, family):
+    """Look up addresses of one family, dropping IPv4-mapped IPv6."""
+    last_exc = None
+    any_ok = False
+    for flags in _gai_flag_sets(family):
+        try:
+            infos = socket.getaddrinfo(
+                host, port, family, socket.SOCK_STREAM, 0, flags
+            )
+        except socket.gaierror as exc:
+            last_exc = exc
+            continue
+        any_ok = True
+        usable = []
+        seen = set()
+        for info in infos:
+            ip = _sockaddr_ip(info[4] if len(info) > 4 else None)
+            if family == socket.AF_INET6:
+                if not _is_usable_ipv6(ip):
+                    continue
+            elif not _is_ipv4_addr(ip):
+                continue
+            if ip in seen:
+                continue
+            seen.add(ip)
+            usable.append(info)
+        if usable:
+            return usable
+    if not any_ok and last_exc is not None:
+        raise last_exc
+    return []
+
+
+def _aaaa_from_system_dns(domain, timeout):
+    """Query AAAA on system resolvers over IPv4 UDP.
+
+    getaddrinfo(AF_INET6) on macOS without a global IPv6 route often returns
+    only ::ffff: mapped IPv4, even when the zone has real AAAA records.
+    """
+    found = []
+    seen_servers = []
+    for server in get_system_dns_servers():
+        if not _is_ipv4_addr(server) or server in seen_servers:
+            continue
+        seen_servers.append(server)
+        try:
+            ips = resolve_dns_custom(
+                domain, server, timeout, qtype=QTYPE_AAAA
+            )
+        except Exception:
+            continue
+        for ip in _ips_of_family(ips, socket.AF_INET6):
+            if ip not in found:
+                found.append(ip)
+        if found:
+            return found
+    return found
+
+
 def _tcp_connect(host, port, family, timeout, source_address=None):
     """TCP connect using only addresses of `family` (no IPv4/IPv6 mix)."""
-    try:
-        infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        raise OSError(str(exc))
     last_err = None
+    try:
+        infos = _family_addrinfo(host, port, family)
+    except socket.gaierror as exc:
+        infos = []
+        last_err = OSError(str(exc))
+    if family == socket.AF_INET6 and not infos:
+        numeric = getattr(socket, "AI_NUMERICHOST", 0) or 0
+        for ip in _aaaa_from_system_dns(host, timeout):
+            try:
+                infos.extend(
+                    socket.getaddrinfo(
+                        ip,
+                        port,
+                        socket.AF_INET6,
+                        socket.SOCK_STREAM,
+                        0,
+                        numeric,
+                    )
+                )
+            except socket.gaierror:
+                continue
     for af, socktype, proto, _canon, sockaddr in infos:
+        ip = _sockaddr_ip(sockaddr)
+        if family == socket.AF_INET6 and not _is_usable_ipv6(ip):
+            continue
+        if family == socket.AF_INET and not _is_ipv4_addr(ip):
+            continue
         sock = None
         try:
             sock = socket.socket(af, socktype, proto)
@@ -334,7 +473,7 @@ def _tcp_connect(host, port, family, timeout, source_address=None):
                     pass
     if last_err is not None:
         raise last_err
-    raise OSError("getaddrinfo returned no addresses")
+    raise OSError("getaddrinfo returned no usable addresses")
 
 def _family_http_connection_class(family, tls):
     base = http.client.HTTPSConnection if tls else http.client.HTTPConnection
@@ -378,11 +517,13 @@ class _FamilyHTTPSHandler(urllib.request.HTTPSHandler):
         self._family = family
 
     def https_open(self, req):
+        # Python 3.14 dropped HTTPSHandler._check_hostname and
+        # HTTPSConnection no longer accepts that kwarg. Hostname checks live
+        # on the SSLContext we already pass.
         return self.do_open(
             _family_http_connection_class(self._family, True),
             req,
             context=self._context,
-            check_hostname=self._check_hostname,
         )
 
 _ssl_ctx = ssl.create_default_context()

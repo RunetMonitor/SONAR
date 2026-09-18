@@ -16,7 +16,8 @@ standard module is missing, it stops with an error before the scan.
 
 ========
 
-Important: run without VPN so the path matches a normal user.
+**Important:** run without VPN so the path matches a normal user.  
+**Important:** use a network cable from your ISP, not a mobile hotspot.
 
 Get a one-time upload token from Na Svyazi Helpdesk  
 (nasvyazi.org / your usual support channel).
@@ -41,7 +42,8 @@ or open terminal, cd to this folder, and run this command:
 
 What happens when you run
 
-1. The script reminds you to run without VPN.  
+1. The script reminds you to run without VPN, on a network cable from  
+   your ISP (not a mobile hotspot).  
    If a newer version exists, it says so in uppercase at the start  
    and again at the end (GitHub/CDNs; if those are blocked, it stays quiet).
 2. It asks for your one-time upload token before the scan.  
@@ -64,7 +66,8 @@ same CSV (dns_probe_* columns).
 Each site is tested over IPv4 and IPv6 separately (always both; there is  
 no switch). The original CSV columns stay IPv4 so older volunteer files  
 still join. IPv6 is extra `*_ipv6` columns. Missing those columns means  
-IPv6 was not measured.
+IPv6 was not measured. AAAA comes from DNS, not from IPv4-mapped  
+`::ffff:` addresses.
 
 ========
 

@@ -294,6 +294,26 @@ class TestBanner:
         assert "\033[38;2;" not in out
         assert "\033[38;5;" not in out
 
+    def test_bold_plain_without_color(self, monkeypatch):
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
+        monkeypatch.setenv("NO_COLOR", "1")
+        monkeypatch.setattr(banner, "_isatty", lambda: False)
+        assert banner.bold("Important:") == "Important:"
+
+    def test_bold_when_force_color(self, monkeypatch):
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(banner, "_isatty", lambda: False)
+        monkeypatch.setattr(banner, "_vt_windows", lambda: True)
+        assert banner.bold("Important:") == "\033[1mImportant:\033[0m"
+
+    def test_bold_plain_on_windows_without_vt(self, monkeypatch):
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(banner.sys, "platform", "win32")
+        monkeypatch.setattr(banner, "_vt_windows", lambda: False)
+        assert banner.bold("Important:") == "Important:"
+
 
 # ---------------------------------------------------------------------------
 # Part 3 - upload token format
@@ -619,6 +639,7 @@ class TestSkipCheckResolve:
 
 class TestResolveDns:
     def test_system_path(self, monkeypatch):
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: [])
         monkeypatch.setattr(
             run.socket,
             "getaddrinfo",
@@ -632,9 +653,10 @@ class TestResolveDns:
 
     def test_system_path_ipv6(self, monkeypatch):
         seen = []
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: [])
 
-        def fake_gai(host, port, family, socktype):
-            seen.append(family)
+        def fake_gai(*a, **k):
+            seen.append(a[2] if len(a) > 2 else k.get("family"))
             return [
                 (socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("2001:db8::1", 0, 0, 0)),
             ]
@@ -643,7 +665,179 @@ class TestResolveDns:
         assert run.resolve_dns("example.com", family=socket.AF_INET6) == [
             "2001:db8::1"
         ]
-        assert seen == [socket.AF_INET6]
+        assert socket.AF_INET6 in seen
+
+    def test_system_path_ipv6_drops_mapped_v4(self, monkeypatch):
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: [])
+        monkeypatch.setattr(
+            run.socket,
+            "getaddrinfo",
+            lambda *a, **k: [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("::ffff:1.2.3.4", 0, 0, 0),
+                ),
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("2001:db8::9", 0, 0, 0),
+                ),
+            ],
+        )
+        assert run.resolve_dns("example.com", family=socket.AF_INET6) == [
+            "2001:db8::9"
+        ]
+
+    def test_system_path_ipv6_mapped_only_is_empty(self, monkeypatch):
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: [])
+        monkeypatch.setattr(
+            run.socket,
+            "getaddrinfo",
+            lambda *a, **k: [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("::ffff:1.2.3.4", 0, 0, 0),
+                )
+            ],
+        )
+        assert run.resolve_dns("example.com", family=socket.AF_INET6) == []
+
+    def test_system_path_ipv6_uses_system_aaaa_query(self, monkeypatch):
+        monkeypatch.setattr(
+            run, "get_system_dns_servers", lambda: ["1.1.1.1", "2001:db8::53", "1.1.1.1"]
+        )
+        called = []
+
+        def fake_custom(domain, server, timeout, qtype=1):
+            called.append((server, qtype))
+            if server == "1.1.1.1":
+                return ["2001:db8::aa", "::ffff:1.2.3.4"]
+            return []
+
+        monkeypatch.setattr(run, "resolve_dns_custom", fake_custom)
+
+        def boom(*a, **k):
+            raise AssertionError("getaddrinfo should not run")
+
+        monkeypatch.setattr(run.socket, "getaddrinfo", boom)
+        assert run.resolve_dns("example.com", family=socket.AF_INET6) == [
+            "2001:db8::aa"
+        ]
+        assert called == [("1.1.1.1", run.QTYPE_AAAA)]
+
+    def test_system_path_ipv6_dns_error_falls_back_to_ai_all(self, monkeypatch):
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: ["8.8.8.8"])
+
+        def fake_custom(*a, **k):
+            raise OSError("timeout")
+
+        monkeypatch.setattr(run, "resolve_dns_custom", fake_custom)
+        calls = []
+
+        def fake_gai(*a, **k):
+            flags = a[5] if len(a) > 5 else k.get("flags", 0)
+            calls.append(flags)
+            if flags == 0 and calls[0] != 0:
+                return [
+                    (
+                        socket.AF_INET6,
+                        socket.SOCK_STREAM,
+                        0,
+                        "",
+                        ("::ffff:1.2.3.4", 0, 0, 0),
+                    )
+                ]
+            return [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("2001:db8::2", 0, 0, 0),
+                )
+            ]
+
+        monkeypatch.setattr(run.socket, "getaddrinfo", fake_gai)
+        assert run.resolve_dns("example.com", family=socket.AF_INET6) == [
+            "2001:db8::2"
+        ]
+        assert calls
+
+    def test_aaaa_from_system_dns_skips_failures(self, monkeypatch):
+        monkeypatch.setattr(
+            run, "get_system_dns_servers", lambda: ["not-ip", "8.8.8.8", "1.1.1.1"]
+        )
+
+        def fake_custom(domain, server, timeout, qtype=1):
+            if server == "8.8.8.8":
+                raise OSError("down")
+            return ["2001:db8::3"]
+
+        monkeypatch.setattr(run, "resolve_dns_custom", fake_custom)
+        assert run._aaaa_from_system_dns("example.com", 1) == ["2001:db8::3"]
+
+    def test_aaaa_from_system_dns_empty_without_ipv4_resolvers(self, monkeypatch):
+        monkeypatch.setattr(run, "get_system_dns_servers", lambda: ["2001:db8::53"])
+        assert run._aaaa_from_system_dns("example.com", 1) == []
+
+    def test_gai_flag_sets(self):
+        assert run._gai_flag_sets(socket.AF_INET) == (0,)
+        ipv6_flags = run._gai_flag_sets(socket.AF_INET6)
+        assert ipv6_flags[-1] == 0
+        extra = getattr(socket, "AI_ALL", 0) or 0
+        if extra:
+            assert ipv6_flags[0] == extra
+
+    def test_family_addrinfo_reraises_when_all_flags_fail(self, monkeypatch):
+        def boom(*a, **k):
+            raise socket.gaierror(8, "nodename")
+
+        monkeypatch.setattr(run.socket, "getaddrinfo", boom)
+        with pytest.raises(socket.gaierror):
+            run._family_addrinfo("nope.invalid", 443, socket.AF_INET6)
+
+    def test_family_addrinfo_empty_sockaddr_is_skipped(self, monkeypatch):
+        monkeypatch.setattr(
+            run.socket,
+            "getaddrinfo",
+            lambda *a, **k: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ()),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", 443)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", 443)),
+            ],
+        )
+        infos = run._family_addrinfo("example.com", 443, socket.AF_INET)
+        assert [info[4][0] for info in infos] == ["1.2.3.4"]
+
+    def test_family_addrinfo_skips_short_info_and_ai_all_error(self, monkeypatch):
+        ai_all = getattr(socket, "AI_ALL", 0)
+
+        def fake_gai(*a, **k):
+            flags = a[5] if len(a) > 5 else 0
+            if ai_all and flags == ai_all:
+                raise socket.gaierror(8, "nodename")
+            return [
+                (socket.AF_INET6, socket.SOCK_STREAM, 0, ""),
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("2001:db8::4", 443, 0, 0),
+                ),
+            ]
+
+        monkeypatch.setattr(run.socket, "getaddrinfo", fake_gai)
+        infos = run._family_addrinfo("example.com", 443, socket.AF_INET6)
+        assert infos[0][4][0] == "2001:db8::4"
 
     def test_custom_path(self, monkeypatch):
         called = {}
@@ -679,6 +873,43 @@ class TestIpFamilyHelpers:
         assert run._ips_of_family(["", "2001:db8::1"], socket.AF_INET6) == [
             "2001:db8::1"
         ]
+        assert run._ips_of_family(["not-an-ip"], socket.AF_INET) == []
+        assert run._ips_of_family(
+            ["::ffff:104.21.40.193", "2001:db8::1"], socket.AF_INET6
+        ) == ["2001:db8::1"]
+        assert run._ips_of_family(["::ffff:1.2.3.4"], socket.AF_INET6) == []
+        assert run._ips_of_family(["::ffff:1.2.3.4"], socket.AF_INET) == []
+
+    def test_usable_ipv6_rejects_mapped_and_local(self):
+        assert run._is_usable_ipv6("2001:db8::1")
+        assert run._is_usable_ipv6("2a02:26f7:2c::1")
+        assert run._is_ipv4_mapped_ipv6("::ffff:104.21.40.193")
+        assert run._is_ipv4_mapped_ipv6("::FFFF:1.2.3.4")
+        assert not run._is_usable_ipv6("::ffff:104.21.40.193")
+        assert not run._is_usable_ipv6("::1")
+        assert not run._is_usable_ipv6("::")
+        assert not run._is_usable_ipv6("fe80::1")
+        assert not run._is_usable_ipv6("ff02::1")
+        assert not run._is_usable_ipv6("1.2.3.4")
+        assert not run._is_usable_ipv6("")
+        assert not run._is_ipv4_mapped_ipv6("2001:db8::1")
+        assert not run._is_ipv4_mapped_ipv6("not-an-ip")
+        assert not run._is_ipv4_mapped_ipv6("")
+        assert run._is_usable_ipv6("64:ff9b::1")
+        assert not run._is_usable_ipv6(None)
+        assert run._is_ipv4_addr("8.8.8.8")
+        assert not run._is_ipv4_addr("2001:db8::1")
+        assert not run._is_ipv4_addr("")
+        assert run._is_ipv6_addr("2001:db8::1")
+        assert not run._is_ipv6_addr("::ffff:1.2.3.4")
+        assert run._sockaddr_ip(None) == ""
+        assert run._sockaddr_ip(()) == ""
+        assert run._sockaddr_ip(("", 443)) == ""
+        assert run._sockaddr_ip(("2001:db8::1", 443, 0, 0)) == "2001:db8::1"
+
+    def test_gai_flag_sets_without_ai_all(self, monkeypatch):
+        monkeypatch.setattr(run.socket, "AI_ALL", 0, raising=False)
+        assert run._gai_flag_sets(socket.AF_INET6) == (0,)
 
     def test_progress_flag(self):
         assert run._progress_flag("YES") == "+"
@@ -703,8 +934,208 @@ class TestIpFamilyHelpers:
             raise socket.gaierror(8, "nodename")
 
         monkeypatch.setattr(run.socket, "getaddrinfo", boom)
+        monkeypatch.setattr(run, "_aaaa_from_system_dns", lambda *a, **k: [])
         with pytest.raises(OSError):
             run._tcp_connect("example.com", 443, socket.AF_INET6, 1)
+
+    def test_tcp_connect_skips_ipv4_mapped_ipv6(self, monkeypatch):
+        monkeypatch.setattr(
+            run.socket,
+            "getaddrinfo",
+            lambda *a, **k: [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("::ffff:104.21.40.193", 443, 0, 0),
+                )
+            ],
+        )
+        monkeypatch.setattr(run, "_aaaa_from_system_dns", lambda *a, **k: [])
+        with pytest.raises(OSError) as ei:
+            run._tcp_connect("example.com", 443, socket.AF_INET6, 1)
+        assert "usable" in str(ei.value)
+
+    def test_tcp_connect_ipv6_falls_back_to_dns_aaaa(self, monkeypatch):
+        monkeypatch.setattr(run, "_aaaa_from_system_dns", lambda *a, **k: ["2001:db8::1"])
+        calls = []
+
+        class FakeSock:
+            def settimeout(self, t):
+                pass
+
+            def setsockopt(self, *a):
+                pass
+
+            def connect(self, addr):
+                calls.append(addr)
+
+            def close(self):
+                pass
+
+        def fake_gai(host, port, *a, **k):
+            if host == "2001:db8::1":
+                return [
+                    (
+                        socket.AF_INET6,
+                        socket.SOCK_STREAM,
+                        0,
+                        "",
+                        ("2001:db8::1", port, 0, 0),
+                    )
+                ]
+            return [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("::ffff:1.2.3.4", port, 0, 0),
+                )
+            ]
+
+        monkeypatch.setattr(run.socket, "getaddrinfo", fake_gai)
+        monkeypatch.setattr(run.socket, "socket", lambda *a, **k: FakeSock())
+        sock = run._tcp_connect("example.com", 443, socket.AF_INET6, 1)
+        assert sock is not None
+        assert calls and calls[0][0] == "2001:db8::1"
+
+    def test_tcp_connect_skips_unusable_numeric_ipv6(self, monkeypatch):
+        monkeypatch.setattr(run, "_aaaa_from_system_dns", lambda *a, **k: ["2001:db8::1"])
+        calls = []
+
+        class FakeSock:
+            def settimeout(self, t):
+                pass
+
+            def setsockopt(self, *a):
+                pass
+
+            def connect(self, addr):
+                calls.append(addr)
+
+            def close(self):
+                pass
+
+        def fake_gai(host, port, *a, **k):
+            if host == "2001:db8::1":
+                return [
+                    (
+                        socket.AF_INET6,
+                        socket.SOCK_STREAM,
+                        0,
+                        "",
+                        ("::ffff:9.9.9.9", port, 0, 0),
+                    ),
+                    (
+                        socket.AF_INET6,
+                        socket.SOCK_STREAM,
+                        0,
+                        "",
+                        ("2001:db8::1", port, 0, 0),
+                    ),
+                ]
+            return [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("::ffff:1.2.3.4", port, 0, 0),
+                )
+            ]
+
+        monkeypatch.setattr(run.socket, "getaddrinfo", fake_gai)
+        monkeypatch.setattr(run.socket, "socket", lambda *a, **k: FakeSock())
+        sock = run._tcp_connect("example.com", 443, socket.AF_INET6, 1)
+        assert sock is not None
+        assert calls == [("2001:db8::1", 443, 0, 0)]
+
+    def test_tcp_connect_skips_non_ipv4_after_family_lookup(self, monkeypatch):
+        monkeypatch.setattr(
+            run,
+            "_family_addrinfo",
+            lambda *a, **k: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 443)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", 443)),
+            ],
+        )
+        calls = []
+
+        class FakeSock:
+            def settimeout(self, t):
+                pass
+
+            def setsockopt(self, *a):
+                pass
+
+            def connect(self, addr):
+                calls.append(addr)
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(run.socket, "socket", lambda *a, **k: FakeSock())
+        sock = run._tcp_connect("example.com", 443, socket.AF_INET, 1)
+        assert sock is not None
+        assert calls == [("1.2.3.4", 443)]
+
+    def test_tcp_connect_ipv6_numeric_gaierror_is_skipped(self, monkeypatch):
+        monkeypatch.setattr(run, "_aaaa_from_system_dns", lambda *a, **k: ["2001:db8::9"])
+
+        def fake_gai(host, *a, **k):
+            if host == "2001:db8::9":
+                raise socket.gaierror(8, "numeric")
+            return [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("::ffff:1.2.3.4", 443, 0, 0),
+                )
+            ]
+
+        monkeypatch.setattr(run.socket, "getaddrinfo", fake_gai)
+        with pytest.raises(OSError) as ei:
+            run._tcp_connect("example.com", 443, socket.AF_INET6, 1)
+        assert "usable" in str(ei.value)
+
+    def test_tcp_connect_skips_non_ipv4_on_v4_family(self, monkeypatch):
+        monkeypatch.setattr(
+            run.socket,
+            "getaddrinfo",
+            lambda *a, **k: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ()),
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    6,
+                    "",
+                    ("2001:db8::1", 443),
+                ),
+            ],
+        )
+        with pytest.raises(OSError) as ei:
+            run._tcp_connect("example.com", 443, socket.AF_INET, 1)
+        assert "usable" in str(ei.value)
+
+    def test_https_handler_does_not_pass_check_hostname(self):
+        handler = run._FamilyHTTPSHandler(socket.AF_INET, context=run._ssl_ctx)
+        seen = {}
+
+        def fake_do_open(http_class, req, **kwargs):
+            seen["kwargs"] = kwargs
+            seen["http_class"] = http_class
+            raise OSError("stop")
+
+        handler.do_open = fake_do_open
+        req = urllib.request.Request("https://example.com/")
+        with pytest.raises(OSError):
+            handler.https_open(req)
+        assert "check_hostname" not in seen["kwargs"]
+        assert "context" in seen["kwargs"]
 
     def test_tcp_connect_ipv6_setsockopt_failure_and_bind(self, monkeypatch):
         calls = []
@@ -875,6 +1306,73 @@ class TestIpFamilyHelpers:
             except Exception:
                 pass
             thread.join(3)
+
+    def test_family_https_handler_fetches_local_tls(self, tmp_path):
+        """Python 3.14 HTTPSHandler has no _check_hostname; a real TLS GET must still work."""
+        import subprocess
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        cert = tmp_path / "cert.pem"
+        key = tmp_path / "key.pem"
+        try:
+            subprocess.check_call(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-keyout",
+                    str(key),
+                    "-out",
+                    str(cert),
+                    "-days",
+                    "1",
+                    "-nodes",
+                    "-subj",
+                    "/CN=127.0.0.1",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            pytest.skip("openssl not available")
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"tls-ok")
+
+            def log_message(self, *_a):
+                pass
+
+        httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert), str(key))
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.handle_request)
+        thread.daemon = True
+        thread.start()
+        try:
+            req = urllib.request.Request("https://127.0.0.1:{}/".format(port))
+            resp = run._urlopen(
+                req, timeout=3, context=run._ssl_ctx, family=socket.AF_INET
+            )
+            try:
+                body = resp.read()
+                assert resp.getcode() == 200
+                assert body == b"tls-ok"
+            finally:
+                resp.close()
+        finally:
+            httpd.server_close()
+            thread.join(3)
+
+
+class TestCheckHttp:
     def test_https_success(self, monkeypatch):
         class FakeResp:
             def getcode(self):
@@ -1176,8 +1674,19 @@ class TestTokenPrompt:
         assert run.prompt_upload_token_before_scan() is None
         out = capsys.readouterr().out
         assert "without VPN" in out
+        assert "network cable" in out
+        assert "mobile hotspot" in out
+        assert "Important:" in out
         assert "Helpdesk" in out
         assert "local scan only" in out.lower() or "No token" in out
+
+    def test_important_is_bold_when_color_forced(self, monkeypatch, capsys):
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr("builtins.input", lambda *_a, **_k: "")
+        assert run.prompt_upload_token_before_scan() is None
+        out = capsys.readouterr().out
+        assert out.count("\033[1mImportant:\033[0m") == 2
 
     def test_valid_token_accepted(self, monkeypatch):
         monkeypatch.setattr(
@@ -1743,6 +2252,9 @@ class TestReadmeVolunteerWording:
     def test_readme_matches_token_source(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         assert "without VPN" in readme
+        assert "network cable" in readme
+        assert "mobile hotspot" in readme
+        assert "**Important:**" in readme
         assert "Helpdesk" in readme
         assert "nasvyazi.org" in readme
         assert "one-time" in readme.lower() or "one-time" in readme
@@ -1756,6 +2268,7 @@ class TestReadmeVolunteerWording:
         assert "3.6" not in readme
         assert "IPv4" in readme
         assert "IPv6" in readme
+        assert "AAAA" in readme or "::ffff:" in readme
 
 
 class TestLaunchersPythonRequirement:
